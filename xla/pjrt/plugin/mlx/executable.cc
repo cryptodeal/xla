@@ -17,6 +17,7 @@ limitations under the License.
 #include <utility>
 #include <unordered_map>
 #include <vector>
+#include <type_traits>
 
 // TODO(@cryptodeal): might need to update `BUILD`
 #include "mlir/IR/Visitors.h"
@@ -53,6 +54,9 @@ limitations under the License.
 #define DEBUG_TYPE "stablehlo-pjrt"
 
 namespace mx = mlx::core;
+
+typedef absl::StatusOr<mx::array> StatusOrArray;
+typedef absl::StatusOr<std::vector<mx::array>> StatusOrArrays;
 
 namespace mlir::stablehlo {
 
@@ -384,50 +388,55 @@ bool isAnyReduce(stablehlo::ReduceOp& reduce_op) {
   return true;
 }
 
-std::vector<mx::array> getArgArrays(
-    mlir::Operation::operand_range values,
+absl::StatusOr<mx::array> getOperandArray(
+    const Value& operand, const std::vector<mx::array> block_args,
     const std::unordered_map<Operation*, std::vector<mx::array>>&
         transient_buffers,
-    const std::vector<mx::array>& block_arguments) {
-  std::vector<mx::array> args;
-  for (Value operand : values) {
-    if (auto defining_op = operand.getDefiningOp()) {
-      // arg was created as a result of previously executed operation
-      // push array to args if found, else return early
-      if (auto search = transient_buffers.find(defining_op);
-          search != transient_buffers.end()) {
-        switch (search->second.size()) {
-          case 0:
-            return args;
-          case 1:
-            args.push_back(search->second[0]);
-            break;
-          default:
-            unsigned i = 0;
-            while (i < defining_op->getNumResults()) {
-              Value op_res = defining_op->getResult(i);
-              if (op_res == operand) break;
-              i++;
-            }
-            if (i < defining_op->getNumResults()) {
-              args.push_back(search->second[i]);
-            } else
-              return args;
-        }
-      } else
-        return args;
-    } else {
-      auto block_arg = operand.cast<BlockArgument>();
-      auto arg_number = block_arg.getArgNumber();
-      // if block arguments contains the arg at the given index,
-      // push to args; else return early
-      if (block_arguments.size() > arg_number)
-        args.push_back(block_arguments[arg_number]);
-      else
-        return args;
-    }
+    const std::unordered_map<const Value*, mx::array>& init_values) {
+  // init values are used for handling custom logic
+  // (e.g. `stablehlo::ReduceOp`); if match is found, use
+  // this value.
+  if (auto search = init_values.find(&operand); search != init_values.end()) {
+    return search->second;
   }
-  return args;
+  // check if operand is the result of a previous operation
+  if (auto defining_op = operand.getDefiningOp()) {
+    if (auto search = transient_buffers.find(defining_op);
+        search != transient_buffers.end()) {
+      switch (search->second.size()) {
+        case 0:
+          return absl::InternalError("Failed to find array for operand");
+        case 1:
+          return search->second[0];
+        default:
+          std::optional<mx::array> array;
+          for (auto i = 0; i < defining_op->getNumResults(); i++) {
+            Value maybe_res = defining_op->getResult(i);
+            if (maybe_res == operand) {
+              array = search->second[i];
+              break;
+            }
+          }
+          if (array.has_value()) {
+            return array.value();
+          } else
+            return absl::InternalError("Failed to find array for operand");
+      }
+    } else
+      return absl::InternalError("Failed to find array for operand");
+
+  } else {
+    // if block arguments contains the arg at the given index,
+    // push to args; else return early
+    return block_args[operand.cast<BlockArgument>().getArgNumber()];
+  }
+}
+
+absl::StatusOr<mx::array> getOperandArray(
+    const Value& operand, const std::vector<mx::array> block_args,
+    const std::unordered_map<Operation*, std::vector<mx::array>>&
+        transient_buffers) {
+  return getOperandArray(operand, block_args, transient_buffers, {});
 }
 
 std::vector<int32_t> getMlxShape(const mlir::ShapedType& dense_elements_type) {
@@ -441,131 +450,142 @@ std::vector<int32_t> getMlxShape(const mlir::ShapedType& dense_elements_type) {
 }
 
 template <typename T>
-mx::array denseElementsArray(const char* buffer,
-                             const std::vector<int32_t>& shape, bool is_splat) {
-  return is_splat ? mx::full<T>(shape, reinterpret_cast<const T*>(buffer)[0])
-                  : mx::array(reinterpret_cast<const T*>(buffer), shape);
-}
-
-mx::array getDenseElementsArray(const mlir::DenseElementsAttr& attr) {
+mx::array denseElementsArray(const mlir::DenseElementsAttr& attr) {
   auto attr_type = attr.getType();
   // convert to mlx shape
-  std::vector<int32_t> attr_shape = getMlxShape(attr_type);
-  auto attr_raw_data = attr.getRawData();
-  const char* buffer_ref = attr_raw_data.data();
-  auto element_type = attr_type.getElementType();
+  std::vector<int32_t> shape = getMlxShape(attr_type);
+  auto it = attr.getValues<T>();
+  std::vector<T> buffer(it.begin(), it.end());
+  // TODO (@cryptodeal): handle complex64
+  if constexpr (std::is_same<T, xla::bfloat16>::value) {
+    return attr.isSplat()
+               ? mx::full<mx::bfloat16_t>(
+                     shape, static_cast<mx::bfloat16_t>(buffer[0]))
+               : mx::array(
+                     reinterpret_cast<const mx::bfloat16_t*>(buffer.data()),
+                     shape);
+  } else if constexpr (std::is_same<T, xla::half>::value) {
+    return attr.isSplat()
+               ? mx::full<mx::float16_t>(shape,
+                                         static_cast<mx::float16_t>(buffer[0]))
+               : mx::array(
+                     reinterpret_cast<const mx::float16_t*>(buffer.data()),
+                     shape);
+  } else if constexpr (std::is_same<T, std::complex<float>>::value) {
+    return attr.isSplat()
+               ? mx::full<mx::complex64_t>(
+                     shape,
+                     reinterpret_cast<const mx::complex64_t*>(buffer.data())[0])
+               : mx::array(
+                     reinterpret_cast<const mx::complex64_t*>(buffer.data()),
+                     shape);
+  } else {
+    return attr.isSplat() ? mx::full<T>(shape, buffer[0])
+                          : mx::array(buffer.begin(), shape);
+  }
+}
 
-  // TODO(@cryptodeal): `Compile` must verify there are no unsupported types.
-
-  return llvm::TypeSwitch<Type, mx::array>(element_type)
+// TODO(@cryptodeal): `Compile` must verify there are no unsupported types.
+absl::StatusOr<mx::array> getDenseElementsArray(
+    const mlir::DenseElementsAttr& attr) {
+  return llvm::TypeSwitch<Type, StatusOrArray>(attr.getType().getElementType())
       // handle integer types
-      .Case<IntegerType>([&buffer_ref, &attr, &attr_shape](auto type) {
+      .Case<IntegerType>([&attr](auto type) -> StatusOrArray {
         switch (type.getWidth()) {
           // handle bool
           case 1:
-            return denseElementsArray<bool>(buffer_ref, attr_shape,
-                                            attr.isSplat());
+            return denseElementsArray<bool>(attr);
           case 8:
-            return type.isSignless()
-                       ? denseElementsArray<int8_t>(buffer_ref, attr_shape,
-                                                    attr.isSplat())
-                       : denseElementsArray<uint8_t>(buffer_ref, attr_shape,
-                                                     attr.isSplat());
+            return type.isSignless() ? denseElementsArray<int8_t>(attr)
+                                     : denseElementsArray<uint8_t>(attr);
           case 16:
-            return type.isSignless()
-                       ? denseElementsArray<int16_t>(buffer_ref, attr_shape,
-                                                     attr.isSplat())
-                       : denseElementsArray<uint16_t>(buffer_ref, attr_shape,
-                                                      attr.isSplat());
+            return type.isSignless() ? denseElementsArray<int16_t>(attr)
+                                     : denseElementsArray<uint16_t>(attr);
           case 32:
-            return type.isSignless()
-                       ? denseElementsArray<int32_t>(buffer_ref, attr_shape,
-                                                     attr.isSplat())
-                       : denseElementsArray<uint32_t>(buffer_ref, attr_shape,
-                                                      attr.isSplat());
+            return type.isSignless() ? denseElementsArray<int32_t>(attr)
+                                     : denseElementsArray<uint32_t>(attr);
           // default is 64 bit width
           default:
-            return type.isSignless()
-                       ? denseElementsArray<int64_t>(buffer_ref, attr_shape,
-                                                     attr.isSplat())
-                       : denseElementsArray<uint64_t>(buffer_ref, attr_shape,
-                                                      attr.isSplat());
+            return type.isSignless() ? denseElementsArray<int64_t>(attr)
+                                     : denseElementsArray<uint64_t>(attr);
         }
       })
-      .Case<BFloat16Type>([&buffer_ref, &attr, &attr_shape](auto type) {
-        return denseElementsArray<mx::bfloat16_t>(buffer_ref, attr_shape,
-                                                  attr.isSplat());
+      .Case<BFloat16Type>([&attr](auto type) -> StatusOrArray {
+        return denseElementsArray<xla::bfloat16>(attr);
       })
-      .Case<Float16Type>([&buffer_ref, &attr, &attr_shape](auto type) {
-        return denseElementsArray<mx::float16_t>(buffer_ref, attr_shape,
-                                                 attr.isSplat());
+      .Case<Float16Type>([&attr](auto type) -> StatusOrArray {
+        return denseElementsArray<xla::half>(attr);
       })
-      .Case<ComplexType>([&buffer_ref, &attr, &attr_shape](auto type) {
-        return denseElementsArray<mx::complex64_t>(buffer_ref, attr_shape,
-                                                   attr.isSplat());
+      .Case<ComplexType>([&attr](auto type) -> StatusOrArray {
+        return denseElementsArray<std::complex<float>>(attr);
       })
-      // Default is Float32Type
-      .Default([&buffer_ref, &attr, &attr_shape](auto type) {
-        return denseElementsArray<float>(buffer_ref, attr_shape,
-                                         attr.isSplat());
+      .Case<Float32Type>([&attr](auto type) -> StatusOrArray {
+        return denseElementsArray<float>(attr);
+      })
+      .Default([](auto type) -> StatusOrArray {
+        return absl::UnimplementedError("Unsupported datatype");
       });
 }
 
-absl::StatusOr<std::vector<mx::array>> evalOp(
-    ModuleOp& module, Operation* op, std::vector<mx::array>& operands) {}
-
-FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
-                                           const std::vector<mx::array>& args) {
+absl::StatusOr<std::vector<mx::array>> evalFunc(
+    ModuleOp& module, func::FuncOp& func, const std::vector<mx::array>& args) {
   std::unordered_map<Operation*, std::vector<mx::array>> transient_buffers;
-  std::optional<std::vector<mx::array>> result;
-  for (mlir::Operation& op : func.front().getOperations()) {
-    op.dump();
-    auto operands = getArgArrays(op.getOperands(), transient_buffers, args);
-    if (operands.size() != op.getNumOperands()) return failure();
-    std::vector<mx::array> init_values;
+  Operation* result_op = nullptr;
+  for (Operation& op : func.front().getOperations()) {
+    // op.dump();
 
     // switch on the operation type
-    bool should_continue =
-        llvm::TypeSwitch<Operation*, bool>(&op)
+    auto maybe_result =
+        llvm::TypeSwitch<Operation*, StatusOrArrays>(&op)
             // TODO(@cryptodeal): handle `func` namespace ops
-            .Case<func::ReturnOp>([&operands, &result](auto op) {
-              result = operands;
-              return true;
+            .Case<func::ReturnOp>([&args, &transient_buffers,
+                                   &result_op](auto op) -> StatusOrArrays {
+              std::vector<mx::array> res;
+              for (Value val : op.getOperands()) {
+                TF_ASSIGN_OR_RETURN(
+                    auto result_array,
+                    getOperandArray(val, args, transient_buffers));
+                res.emplace_back(result_array);
+              }
+              result_op = op;
+              return res;
             })
-            .Case<func::CallOp>(
-                [&module, &transient_buffers, &operands](auto op) {
-                  auto callee =
-                      module.lookupSymbol<mlir::func::FuncOp>(op.getCallee());
-                  auto maybe_result = evalFunc(module, callee, operands);
-                  if (failed(maybe_result)) return false;
-                  transient_buffers.emplace(op, maybe_result.value());
-                  return true;
-                })
+            .Case<func::CallOp>([&args, &module, &transient_buffers](
+                                    auto op) -> StatusOrArrays {
+              auto callee =
+                  module.lookupSymbol<mlir::func::FuncOp>(op.getCallee());
+              std::vector<mx::array> operands;
+              for (Value val : op.getOperands()) {
+                TF_ASSIGN_OR_RETURN(
+                    auto operand_array,
+                    getOperandArray(val, args, transient_buffers));
+                operands.emplace_back(operand_array);
+              }
+              return evalFunc(module, callee, operands);
+            })
             // Handle StableHLO nullary ops
             .Case<stablehlo::ConstantOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {getDenseElementsArray(
-                      mlir::cast<mlir::DenseElementsAttr>(op.getValue()))};
-                  transient_buffers.emplace(op, res);
-                  return true;
+                [&transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(
+                      auto value,
+                      getDenseElementsArray(
+                          mlir::cast<mlir::DenseElementsAttr>(op.getValue())));
+                  return std::vector<mx::array>{value};
                 })
-            .Case<stablehlo::IotaOp>([&transient_buffers, &operands](auto op) {
+            .Case<stablehlo::IotaOp>([](auto op) -> StatusOrArrays {
               auto result_type = op.getResult().getType();
-              std::vector<int32_t> shape =
-                  getMlxShape(mlir::cast<ShapedType>(result_type));
+              auto shape = getMlxShape(mlir::cast<ShapedType>(result_type));
               auto iota_dimension = op.getIotaDimension();
               std::vector<int32_t> dimensions;
               for (auto i = 0; i < dimensions.size(); i++) {
                 dimensions.push_back(i != iota_dimension ? 1 : shape[i]);
               }
-              std::vector<mx::array> res = {mx::broadcast_to(
+              return std::vector<mx::array>{mx::broadcast_to(
                   mx::reshape(
                       mx::arange(static_cast<double>(shape[iota_dimension]),
-                                 dtypeFromType(result_type)),
+                                 dtypeFromType(result_type.getElementType())),
                       dimensions),
                   shape)};
-              transient_buffers.emplace(op, res);
-              return true;
             })
             // .Case<stablehlo::DynamicIotaOp>([](auto op) {})
             /*
@@ -576,194 +596,270 @@ FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
             */
 
             // Handle StableHLO unary elementwise op
-            .Case<stablehlo::AbsOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::abs(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::AbsOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::abs(operand)};
+                })
+            .Case<stablehlo::CbrtOp>([&args, &transient_buffers](
+                                         auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto operand,
+                  getOperandArray(op.getOperand(), args, transient_buffers));
+              return std::vector<mx::array>{mx::power(
+                  operand,
+                  mx::full<float>(operand.shape(), 1 / 3, operand.dtype()))};
             })
-            .Case<stablehlo::CbrtOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::power(
-                  operands[0], mx::full<float>(operands[0].shape(), 1 / 3,
-                                               operands[0].dtype()))};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
-            .Case<stablehlo::CeilOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::ceil(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
-
-            .Case<stablehlo::ConvertOp>([&transient_buffers,
-                                         &operands](auto op) {
-              std::vector<mx::array> res = {mx::astype(
-                  operands[0],
+            .Case<stablehlo::CeilOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::ceil(operand)};
+                })
+            .Case<stablehlo::ConvertOp>([&args, &transient_buffers](
+                                            auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto operand,
+                  getOperandArray(op.getOperand(), args, transient_buffers));
+              return std::vector<mx::array>{mx::astype(
+                  operand,
                   dtypeFromType(op.getResult().getType().getElementType()))};
-              transient_buffers.emplace(op, res);
-              return true;
             })
             // .Case<stablehlo::ClzOp>([](auto op) {})
             .Case<stablehlo::CosineOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {mx::cos(operands[0])};
-                  transient_buffers.emplace(op, res);
-                  return true;
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::cos(operand)};
                 })
-            .Case<stablehlo::ExpOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::exp(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
-            .Case<stablehlo::Expm1Op>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::expm1(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
-            .Case<stablehlo::FloorOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::floor(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
-            .Case<stablehlo::ImagOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::imag(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
+            .Case<stablehlo::ExpOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::exp(operand)};
+                })
+            .Case<stablehlo::Expm1Op>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::expm1(operand)};
+                })
+            .Case<stablehlo::FloorOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::floor(operand)};
+                })
+            .Case<stablehlo::ImagOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::imag(operand)};
+                })
             .Case<stablehlo::IsFiniteOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {mx::isfinite(operands[0])};
-                  transient_buffers.emplace(op, res);
-                  return true;
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::isfinite(operand)};
                 })
-            .Case<stablehlo::LogOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::log(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
-            .Case<stablehlo::Log1pOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::log1p(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
+            .Case<stablehlo::LogOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::log(operand)};
+                })
+            .Case<stablehlo::Log1pOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::log1p(operand)};
+                })
             .Case<stablehlo::LogisticOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {mx::sigmoid(operands[0])};
-                  transient_buffers.emplace(op, res);
-                  return true;
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::sigmoid(operand)};
                 })
-            .Case<stablehlo::NotOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::logical_not(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
-            .Case<stablehlo::NegOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::negative(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
+            .Case<stablehlo::NotOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::logical_not(operand)};
+                })
+            .Case<stablehlo::NegOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::negative(operand)};
+                })
             // .Case<stablehlo::PopulationCountOp>([](auto op) {})
-            .Case<stablehlo::RealOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::real(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
+            .Case<stablehlo::RealOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::real(operand)};
+                })
             // `stablehlo::RoundOp` does not match with the mlx metal
             // implementation .Case<stablehlo::RoundOp>([](auto op) {})
             .Case<stablehlo::RoundNearestEvenOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {mx::round(operands[0])};
-                  transient_buffers.emplace(op, res);
-                  return true;
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::round(operand)};
                 })
-            .Case<stablehlo::RsqrtOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::rsqrt(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
-            .Case<stablehlo::SignOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::sign(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
-            .Case<stablehlo::SineOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::sin(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
-            .Case<stablehlo::SqrtOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::sqrt(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
-            .Case<stablehlo::TanOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::tan(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
-            .Case<stablehlo::TanhOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::tanh(operands[0])};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
+            .Case<stablehlo::RsqrtOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::rsqrt(operand)};
+                })
+            .Case<stablehlo::SignOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::sign(operand)};
+                })
+            .Case<stablehlo::SineOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::sin(operand)};
+                })
+            .Case<stablehlo::SqrtOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::sqrt(operand)};
+                })
+            .Case<stablehlo::TanOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::tan(operand)};
+                })
+            .Case<stablehlo::TanhOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::tanh(operand)};
+                })
 
             // Handle StableHLO binary elementwise ops
-            .Case<stablehlo::AddOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {mx::add(operands[0], operands[1])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::AddOp>([&args, &transient_buffers](
+                                        auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::add(lhs, rhs)};
             })
-            .Case<stablehlo::Atan2Op>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {
-                  mx::arctan2(operands[0], operands[1])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::Atan2Op>([&args, &transient_buffers](
+                                          auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::arctan2(lhs, rhs)};
             })
             // TODO(@cryptodeal): implement complex op
             // .Case<stablehlo::ComplexOp>([&transient_buffers, &operands](auto
             // op) {})
-            .Case<stablehlo::DivOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {
-                  mx::divide(operands[0], operands[1])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::DivOp>([&args, &transient_buffers](
+                                        auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::divide(lhs, rhs)};
             })
-            .Case<stablehlo::MaxOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {
-                  mx::maximum(operands[0], operands[1])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::MaxOp>([&args, &transient_buffers](
+                                        auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::maximum(lhs, rhs)};
             })
-            .Case<stablehlo::MinOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {
-                  mx::minimum(operands[0], operands[1])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::MinOp>([&args, &transient_buffers](
+                                        auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::minimum(lhs, rhs)};
             })
-            .Case<stablehlo::MulOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {
-                  mx::multiply(operands[0], operands[1])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::MulOp>([&args, &transient_buffers](
+                                        auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::multiply(lhs, rhs)};
             })
-            .Case<stablehlo::PowOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {
-                  mx::power(operands[0], operands[1])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::PowOp>([&args, &transient_buffers](
+                                        auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::power(lhs, rhs)};
             })
-            .Case<stablehlo::RemOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {
-                  mx::remainder(operands[0], operands[1])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::RemOp>([&args, &transient_buffers](
+                                        auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::remainder(lhs, rhs)};
             })
-            .Case<stablehlo::ShiftLeftOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {
-                      mx::left_shift(operands[0], operands[1])};
-                  transient_buffers.emplace(op, res);
-                  return true;
-                })
+            .Case<stablehlo::ShiftLeftOp>([&args, &transient_buffers](
+                                              auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::left_shift(lhs, rhs)};
+            })
             /**
              * Per Metal Spec:
              * For the right-shift operator, if E1 has an unsigned type or if
@@ -774,38 +870,56 @@ FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
              */
             .Case<stablehlo::ShiftRightArithmeticOp,
                   stablehlo::ShiftRightLogicalOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {
-                      mx::right_shift(operands[0], operands[1])};
-                  transient_buffers.emplace(op, res);
-                  return true;
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto lhs,
+                                      getOperandArray(op.getOperand(0), args,
+                                                      transient_buffers));
+                  TF_ASSIGN_OR_RETURN(auto rhs,
+                                      getOperandArray(op.getOperand(1), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{mx::right_shift(lhs, rhs)};
                 })
-            .Case<stablehlo::SubtractOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {
-                      mx::subtract(operands[0], operands[1])};
-                  transient_buffers.emplace(op, res);
-                  return true;
-                })
+            .Case<stablehlo::SubtractOp>([&args, &transient_buffers](
+                                             auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::subtract(lhs, rhs)};
+            })
 
             // Handle StableHLO binary logical elementwise ops
-            .Case<stablehlo::AndOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {
-                  mx::logical_and(operands[0], operands[1])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::AndOp>([&args, &transient_buffers](
+                                        auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::logical_and(lhs, rhs)};
             })
-            .Case<stablehlo::OrOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {
-                  mx::logical_or(operands[0], operands[1])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::OrOp>([&args, &transient_buffers](
+                                       auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::logical_or(lhs, rhs)};
             })
-            .Case<stablehlo::XorOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {
-                  mx::bitwise_xor(operands[0], operands[1])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::XorOp>([&args, &transient_buffers](
+                                        auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              return std::vector<mx::array>{mx::bitwise_xor(lhs, rhs)};
             })
 
             // TODO(@cryptodeal): probably don't need to implement all
@@ -834,79 +948,77 @@ FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
             // TODO (@cryptodeal): `stablehlo::ReduceOp` currently only supports
             // specific well defined use cases in zml. Longer term, should
             // support custom use cases of `zml.ops.reduce`.
-            .Case<stablehlo::ReduceOp>([&transient_buffers, &operands,
-                                        &op](auto reduce_op) {
-              if (isArgMaxReduce(reduce_op)) {
+            .Case<stablehlo::ReduceOp>([&args, &transient_buffers](
+                                           auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto operand,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              if (isArgMaxReduce(op)) {
                 // std::cout << "ArgMaxReduceOp\n" << std::endl;
-                auto axis = static_cast<int>(reduce_op.getDimensions()[0]);
-                auto indices = mx::argmax(operands[0], axis);
-                // TODO (@cryptodeal): convert indices to result type
-                std::vector<mx::array> res = {
-                    mx::take(operands[0], indices, axis),
-                    mx::astype(indices, mx::uint8)};
-                transient_buffers.emplace(reduce_op, res);
-                return true;
-              } else if (isSumReduce(reduce_op)) {
-                std::vector<mx::array> res = {
-                    mx::sum(operands[0],
-                            static_cast<int>(reduce_op.getDimensions()[0]))};
-                transient_buffers.emplace(reduce_op, res);
-                return true;
-              } else if (isMaxReduce(reduce_op)) {
-                std::vector<mx::array> res = {
-                    mx::max(operands[0],
-                            static_cast<int>(reduce_op.getDimensions()[0]))};
-                transient_buffers.emplace(reduce_op, res);
-                return true;
-              } else if (isMinReduce(reduce_op)) {
-                std::vector<mx::array> res = {
-                    mx::min(operands[0],
-                            static_cast<int>(reduce_op.getDimensions()[0]))};
-                transient_buffers.emplace(reduce_op, res);
-                return true;
-              } else if (isAnyReduce(reduce_op)) {
-                std::vector<mx::array> res = {
-                    mx::any(operands[0],
-                            static_cast<int>(reduce_op.getDimensions()[0]))};
-                transient_buffers.emplace(reduce_op, res);
-                return true;
-              } else
-                return false;
+                auto axis = static_cast<int>(op.getDimensions()[0]);
+                auto indices = mx::argmax(operand, axis);
+                return std::vector<mx::array>{
+                    mx::take(operand, indices, axis),
+                    mx::astype(indices,
+                               dtypeFromType(mlir::cast<ShapedType>(
+                                                 op.getResults()[1].getType())
+                                                 .getElementType()))};
+              }
+              if (isSumReduce(op)) {
+                return std::vector<mx::array>{
+                    mx::sum(operand, static_cast<int>(op.getDimensions()[0]))};
+              }
+              if (isMaxReduce(op)) {
+                return std::vector<mx::array>{
+                    mx::max(operand, static_cast<int>(op.getDimensions()[0]))};
+              }
+              if (isMinReduce(op)) {
+                return std::vector<mx::array>{
+                    mx::min(operand, static_cast<int>(op.getDimensions()[0]))};
+              }
+              if (isAnyReduce(op)) {
+                return std::vector<mx::array>{
+                    mx::any(operand, static_cast<int>(op.getDimensions()[0]))};
+              }
+
+              return absl::UnimplementedError(
+                  "Unsupported custom `reduce` operation");
             })
 
             // Handle StableHLO tuple ops
             // .Case<stablehlo::GetTupleElementOp>([](auto op) {})
             // .Case<stablehlo::TupleOp>([](auto op) {})
 
-            .Case<stablehlo::CompareOp>([&transient_buffers,
-                                         &operands](auto op) {
-              auto comp_dir = op.getComparisonDirection();
-              std::vector<mx::array> res;
+            .Case<stablehlo::CompareOp>([&args, &transient_buffers](
+                                            auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
               switch (op.getComparisonDirection()) {
                 case ComparisonDirection::NE:
-                  res.emplace_back(mx::not_equal(operands[0], operands[1]));
-                  break;
+                  return std::vector<mx::array>{mx::not_equal(lhs, rhs)};
                 case ComparisonDirection::GE:
-                  res.emplace_back(mx::greater_equal(operands[0], operands[1]));
-                  break;
+                  return std::vector<mx::array>{mx::greater_equal(lhs, rhs)};
                 case ComparisonDirection::GT:
-                  res.emplace_back(mx::greater(operands[0], operands[1]));
-                  break;
+                  return std::vector<mx::array>{mx::greater(lhs, rhs)};
                 case ComparisonDirection::LE:
-                  res.emplace_back(mx::less_equal(operands[0], operands[1]));
-                  break;
+                  return std::vector<mx::array>{mx::less_equal(lhs, rhs)};
                 case ComparisonDirection::LT:
-                  res.emplace_back(mx::less(operands[0], operands[1]));
-                  break;
-                default:
-                  res.emplace_back(mx::equal(operands[0], operands[1]));
+                  return std::vector<mx::array>{mx::less(lhs, rhs)};
+                case ComparisonDirection::EQ:
+                  return std::vector<mx::array>{mx::equal(lhs, rhs)};
               }
-              transient_buffers.emplace(op, res);
-              return true;
             })
 
             // Handle StableHLO Slice ops
-            .Case<stablehlo::SliceOp>([&transient_buffers, &operands](auto op) {
+            .Case<stablehlo::SliceOp>([&args, &transient_buffers](
+                                          auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto operand,
+                  getOperandArray(op.getOperand(), args, transient_buffers));
               auto op_start_indices = op.getStartIndices();
               auto op_limit_indices = op.getLimitIndices();
               auto op_strides = op.getStrides();
@@ -920,10 +1032,8 @@ FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
                     static_cast<int32_t>(op_limit_indices[i]));
                 strides.push_back(static_cast<int32_t>(op_strides[i]));
               }
-              std::vector<mx::array> res = {mx::slice(
-                  operands[0], start_indices, limit_indices, strides)};
-              transient_buffers.emplace(op, res);
-              return true;
+              return std::vector<mx::array>{
+                  mx::slice(operand, start_indices, limit_indices, strides)};
             })
             // .Case<stablehlo::DynamicSliceOp>([](auto op) {})
             // .Case<stablehlo::DynamicUpdateSliceOp>([](auto op) {})
@@ -939,34 +1049,47 @@ FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
                 https://github.com/openxla/stablehlo/issues/2340
                 https://github.com/openxla/stablehlo/pull/2283
             */
-            .Case<stablehlo::BroadcastInDimOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {mx::broadcast_to(
-                      operands[0], getMlxShape(mlir::cast<ShapedType>(
-                                       op.getResult().getType())))};
-                  transient_buffers.emplace(op, res);
-                  return true;
-                })
+            .Case<stablehlo::BroadcastInDimOp>([&args, &transient_buffers](
+                                                   auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto operand,
+                  getOperandArray(op.getOperand(), args, transient_buffers));
+              return std::vector<mx::array>{
+                  mx::broadcast_to(operand, getMlxShape(mlir::cast<ShapedType>(
+                                                op.getResult().getType())))};
+            })
             // .Case<stablehlo::DynamicBroadcastInDimOp>([](auto op) {})
             .Case<stablehlo::CholeskyOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {
-                      mx::linalg::cholesky(operands[0], op.getLower() != 0)};
-                  transient_buffers.emplace(op, res);
-                  return true;
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{
+                      mx::linalg::cholesky(operand, op.getLower() != 0)};
                 })
-            .Case<stablehlo::ClampOp>([&transient_buffers, &operands](auto op) {
-              std::vector<mx::array> res = {
-                  mx::clip(operands[1], operands[0], operands[2])};
-              transient_buffers.emplace(op, res);
-              return true;
+            .Case<stablehlo::ClampOp>([&args, &transient_buffers](
+                                          auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto a_min,
+                  getOperandArray(op.getMin(), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto a, getOperandArray(op.getOperand(), args,
+                                                          transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto a_max,
+                  getOperandArray(op.getMax(), args, transient_buffers));
+              return std::vector<mx::array>{mx::clip(a, a_min, a_max)};
             })
             .Case<stablehlo::ConcatenateOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  std::vector<mx::array> operands;
+                  for (Value val : op.getOperands()) {
+                    TF_ASSIGN_OR_RETURN(
+                        auto operand_array,
+                        getOperandArray(val, args, transient_buffers));
+                    operands.emplace_back(operand_array);
+                  }
+                  return std::vector<mx::array>{
                       mx::concatenate(operands, op.getDimension())};
-                  transient_buffers.emplace(op, res);
-                  return true;
                 })
             // .Case<stablehlo::CollectiveBroadcastOp>([](auto op) {})
             // .Case<stablehlo::CollectivePermuteOp>([](auto op) {})
@@ -980,8 +1103,14 @@ FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
                 https://github.com/openxla/stablehlo/issues/2340
                 https://github.com/openxla/stablehlo/pull/2283
             */
-            .Case<stablehlo::DotGeneralOp>([&transient_buffers,
-                                            &operands](auto op) {
+            .Case<stablehlo::DotGeneralOp>([&args, &transient_buffers](
+                                               auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto lhs,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto rhs,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
               auto lhs_batch_dims =
                   op.getDotDimensionNumbers().getLhsBatchingDimensions();
               auto rhs_batch_dims =
@@ -1016,7 +1145,7 @@ FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
               }
 
               std::string lhs_subscript;
-              for (auto i = 0; i < operands[0].ndim(); ++i) {
+              for (auto i = 0; i < lhs.ndim(); ++i) {
                 if (auto match = lhs_batch_map.find(i);
                     match != lhs_batch_map.end()) {
                   lhs_subscript = lhs_subscript + match->second;
@@ -1031,7 +1160,7 @@ FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
               }
 
               std::string rhs_subscript;
-              for (auto i = 0; i < operands[1].ndim(); ++i) {
+              for (auto i = 0; i < rhs.ndim(); ++i) {
                 if (auto match = rhs_batch_map.find(i);
                     match != rhs_batch_map.end()) {
                   rhs_subscript = rhs_subscript + match->second;
@@ -1045,11 +1174,9 @@ FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
                 }
               }
 
-              std::vector<mx::array> res = {mx::einsum(
+              return std::vector<mx::array>{mx::einsum(
                   lhs_subscript + "," + rhs_subscript + "->" + res_subscript,
-                  {operands[0], operands[1]})};
-              transient_buffers.emplace(op, res);
-              return true;
+                  {lhs, rhs})};
             })
             /*
               .Case<stablehlo::EinsumOp>([](auto op) {})
@@ -1061,45 +1188,56 @@ FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
             // .Case<stablehlo::FftOp>([](auto op) {})
             // .Case<stablehlo::GatherOp>([](auto op) {})
             .Case<stablehlo::GetDimensionSizeOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {
-                      mx::array(operands[0].shape(op.getDimension()))};
-                  transient_buffers.emplace(op, res);
-                  return true;
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{
+                      mx::array(operand.shape(op.getDimension()))};
                 })
             // .Case<stablehlo::MapOp>([](auto op) {})
             .Case<stablehlo::ReshapeOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {mx::reshape(
-                      operands[0], getMlxShape(mlir::cast<ShapedType>(
-                                       op.getResult().getType())))};
-                  transient_buffers.emplace(op, res);
-                  return true;
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  return std::vector<mx::array>{
+                      mx::reshape(operand, getMlxShape(mlir::cast<ShapedType>(
+                                               op.getResult().getType())))};
                 })
             // .Case<stablehlo::DynamicReshapeOp>([](auto op) {})
-            // .Case<stablehlo::ScatterOp>([](auto op) {})
-            .Case<stablehlo::SelectOp>(
-                [&transient_buffers, &operands](auto op) {
-                  std::vector<mx::array> res = {
-                      mx::where(operands[0], operands[1], operands[2])};
-                  transient_buffers.emplace(op, res);
-                  return true;
-                })
+            // .Case<stablehlo::ScatterOp>([&transient_buffers, &operands](auto
+            // op) {
+            // })
+            .Case<stablehlo::SelectOp>([&args, &transient_buffers](
+                                           auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto condition,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto x,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  auto y,
+                  getOperandArray(op.getOperand(2), args, transient_buffers));
+              return std::vector<mx::array>{mx::where(condition, x, y)};
+            })
             // .Case<stablehlo::SelectAndScatterOp>([](auto op) {})
             // .Case<stablehlo::SetDimensionSizeOp>([](auto op) {})
             // .Case<stablehlo::SortOp>([](auto op) {})
             // .Case<stablehlo::ReverseOp>([](auto op) {})
             // .Case<stablehlo::PadOp>([](auto op) {})
-            .Case<stablehlo::TransposeOp>([&transient_buffers,
-                                           &operands](auto op) {
-              std::vector<int> axes;
-              for (auto axis : op.getPermutation()) {
-                axes.push_back(static_cast<int>(axis));
-              }
-              std::vector<mx::array> res = {mx::transpose(operands[0], axes)};
-              transient_buffers.emplace(op, res);
-              return true;
-            })
+            .Case<stablehlo::TransposeOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  std::vector<int> axes;
+                  for (auto axis : op.getPermutation()) {
+                    axes.push_back(static_cast<int>(axis));
+                  }
+                  return std::vector<mx::array>{mx::transpose(operand, axes)};
+                })
             // .Case<stablehlo::TriangularSolveOp>([](auto op) {})
             // .Case<stablehlo::ReduceWindowOp>([](auto op) {})
             // .Case<stablehlo::ReturnOp>([](auto op) {})
@@ -1108,24 +1246,32 @@ FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
             // .Case<stablehlo::CrossReplicaSumOp>([](auto op) {})
 
             // Handle StableHLO RNG ops
-            .Case<stablehlo::RngOp>([&transient_buffers, &operands](auto op) {
-              auto shape_buffer = operands[2].data<int64_t>();
+            .Case<stablehlo::RngOp>([&args, &transient_buffers](
+                                        auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  mx::array a,
+                  getOperandArray(op.getOperand(0), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  mx::array b,
+                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(
+                  mx::array dims,
+                  getOperandArray(op.getOperand(2), args, transient_buffers));
+              auto shape_buffer = dims.data<int64_t>();
               std::vector<int32_t> shape;
-              for (auto i = 0; i < operands[2].size(); i++) {
+              for (auto i = 0; i < dims.size(); i++) {
                 shape.push_back(static_cast<int32_t>(shape_buffer[i]));
               }
               std::vector<mx::array> res;
               if (op.getRngDistribution() == RngDistribution::UNIFORM) {
-                res.emplace_back(mx::random::uniform(
-                    operands[0], operands[1], shape, operands[0].dtype()));
+                return std::vector<mx::array>{
+                    mx::random::uniform(a, b, shape, a.dtype())};
               } else {
-                res.emplace_back(mx::random::normal(
-                    shape, operands[0].dtype(),
-                    mx::astype(operands[0], mx::float32).item<float>(),
-                    mx::astype(operands[1], mx::float32).item<float>()));
+                return std::vector<mx::array>{mx::random::normal(
+                    shape, a.dtype(),
+                    (mx::astype(a, mx::float32)).item<float>(),
+                    (mx::astype(b, mx::float32)).item<float>())};
               }
-              transient_buffers.emplace(op, res);
-              return true;
             })
             // .Case<stablehlo::RngBitGeneratorOp>([](auto op) {})
 
@@ -1142,16 +1288,18 @@ FailureOr<std::vector<mx::array>> evalFunc(ModuleOp& module, func::FuncOp& func,
             // .Case<stablehlo::DynamicPadOp>([](auto op) {})
             // .Case<stablehlo::DynamicGatherOp>([](auto op) {})
             // .Case<stablehlo::DynamicConvOp>([](auto op) {})
-            .Default([](auto op) {
-              // unhandled op, interrupt walk
-              return false;
+            .Default([](auto op) -> StatusOrArrays {
+              return absl::UnimplementedError(
+                  absl::StrCat("Unsupported op: ", ToString(op)));
             });
-    if (!should_continue) return failure();
+    if (maybe_result.ok()) {
+      transient_buffers.emplace(&op, *maybe_result);
+    } else {
+      return maybe_result.status();
+    }
   }
-  if (result.has_value()) {
-    return result.value();
-  } else
-    return failure();
+
+  return transient_buffers.find(result_op)->second;
 }
 
 class MlirLoadedExecutable : public PjRtLoadedExecutable {
@@ -1224,12 +1372,13 @@ class MlirLoadedExecutable : public PjRtLoadedExecutable {
     return devices_[0]->default_memory_space().value_or(nullptr);
   }
 
-  FailureOr<SmallVector<DenseElementsAttr>> evalModule(
+  absl::StatusOr<SmallVector<DenseElementsAttr>> evalModule(
       ModuleOp& module, const SmallVector<mlir::DenseElementsAttr>& inputs) {
     // TRACE_ME_MEMBER;
     std::vector<mx::array> block_arguments;
     for (auto input : inputs) {
-      block_arguments.push_back(getDenseElementsArray(input));
+      TF_ASSIGN_OR_RETURN(auto input_arr, getDenseElementsArray(input));
+      block_arguments.emplace_back(input_arr);
     }
 
     // TODO(@cryptodeal): operations can return multiple results,
@@ -1238,27 +1387,26 @@ class MlirLoadedExecutable : public PjRtLoadedExecutable {
 
     // holds intermediary results of operation calls.
     std::unordered_map<Operation*, mx::array> transient_buffers;
-    // module.dump();
-    // std::cout << std::endl << std::endl;
+    std::cout << std::endl << std::endl;
+    module.dump();
     auto main = module.lookupSymbol<mlir::func::FuncOp>("main");
-    auto res = evalFunc(module, main, block_arguments);
-    if (failed(res)) {
-      return failure();
-    } else {
-      SmallVector<DenseElementsAttr> result;
-      for (auto& arr : res.value()) {
-        mx::eval(arr);
-        SmallVector<int64_t> shape;
-        for (auto dim : arr.shape()) {
-          shape.push_back(static_cast<int64_t>(dim));
-        }
-        ArrayRef<char> data(arr.data<char>(), arr.nbytes());
-        DenseElementsAttr out = DenseElementsAttr::getFromRawBuffer(
-            getResultType(module, arr.dtype(), shape), data);
-        result.push_back(out);
+    TF_ASSIGN_OR_RETURN(auto mlx_res, evalFunc(module, main, block_arguments));
+
+    SmallVector<DenseElementsAttr> result;
+    for (auto& a : mlx_res) {
+      auto arr = mx::contiguous(a);
+      arr.eval();
+      SmallVector<int64_t> shape;
+      for (auto dim : arr.shape()) {
+        shape.push_back(static_cast<int64_t>(dim));
       }
-      return result;
+      ArrayRef<char> data(arr.data<char>(), arr.nbytes());
+      DenseElementsAttr out = DenseElementsAttr::getFromRawBuffer(
+          getResultType(module, arr.dtype(), shape), data);
+      result.push_back(out);
     }
+    return result;
+
     // // register all function declarations
     // std::unordered_map<std::string, mlir::func::FuncOp> function_decls;
     // for (auto func : module.getOps<mlir::func::FuncOp>()) {
@@ -1304,18 +1452,15 @@ class MlirLoadedExecutable : public PjRtLoadedExecutable {
     }
     // LOG(INFO) << "EvalModule:\n" << ToString(module) << "\n";
     // LOG(INFO) << "Inputs: " << ToString(inputs) << "\n";
-    FailureOr<SmallVector<DenseElementsAttr>> result =
-        evalModule(module, inputs);
-    if (failed(result)) {
-      return absl::InternalError("Failed to execute module");
-    }
+    TF_ASSIGN_OR_RETURN(auto result, evalModule(module, inputs));
+
     // LOG(INFO) << "Results: " << ToString(result.value()) << "\n";
 
     // Naive memory space selection, only using CPU global memory.
     PjRtMemorySpace* memory_space =
         device->default_memory_space().value_or(nullptr);
     std::vector<std::unique_ptr<PjRtBuffer>> buffer_results;
-    for (auto res : result.value()) {
+    for (auto res : result) {
       buffer_results.push_back(
           CreateMlirBufferFromAttribute(res, memory_space));
     }
