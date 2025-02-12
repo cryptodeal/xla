@@ -57,6 +57,7 @@ namespace mx = mlx::core;
 
 typedef absl::StatusOr<mx::array> StatusOrArray;
 typedef absl::StatusOr<std::vector<mx::array>> StatusOrArrays;
+typedef absl::StatusOr<int> StatusOrInt;
 
 namespace mlir::stablehlo {
 
@@ -449,6 +450,25 @@ std::vector<int32_t> getMlxShape(const mlir::ShapedType& dense_elements_type) {
   return shape;
 }
 
+absl::StatusOr<int> getByteWidth(const mlir::Type& t) {
+  return llvm::TypeSwitch<Type, StatusOrInt>(t)
+      .Case<IntegerType>([](auto t) -> StatusOrInt {
+        auto bit_width = t.getWidth();
+        if (bit_width < 8 || bit_width % 8 != 0) {
+          return absl::UnimplementedError(
+              "RngBitGeneratorOp: element type width < 8 bits "
+              "or not a multiple of 8 bits");
+        } else
+          return bit_width / 8;
+      })
+      .Case<BFloat16Type>([](auto t) -> StatusOrInt { return 2; })
+      .Case<Float16Type>([](auto t) -> StatusOrInt { return 2; })
+      .Case<Float32Type>([](auto t) -> StatusOrInt { return 4; })
+      .Default([](auto t) -> StatusOrInt {
+        return absl::UnimplementedError("Unsupported element type");
+      });
+}
+
 template <typename T>
 mx::array denseElementsArray(const mlir::DenseElementsAttr& attr) {
   auto attr_type = attr.getType();
@@ -580,11 +600,12 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
               for (auto i = 0; i < dimensions.size(); i++) {
                 dimensions.push_back(i != iota_dimension ? 1 : shape[i]);
               }
+              auto init_arange =
+                  mx::arange(static_cast<double>(shape[iota_dimension]),
+                             dtypeFromType(result_type.getElementType()));
               return std::vector<mx::array>{mx::broadcast_to(
-                  mx::reshape(
-                      mx::arange(static_cast<double>(shape[iota_dimension]),
-                                 dtypeFromType(result_type.getElementType())),
-                      dimensions),
+                  dimensions.size() ? mx::reshape(init_arange, dimensions)
+                                    : init_arange,
                   shape)};
             })
             // .Case<stablehlo::DynamicIotaOp>([](auto op) {})
@@ -769,22 +790,18 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
             // Handle StableHLO binary elementwise ops
             .Case<stablehlo::AddOp>([&args, &transient_buffers](
                                         auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               return std::vector<mx::array>{mx::add(lhs, rhs)};
             })
             .Case<stablehlo::Atan2Op>([&args, &transient_buffers](
                                           auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               return std::vector<mx::array>{mx::arctan2(lhs, rhs)};
             })
             // TODO(@cryptodeal): implement complex op
@@ -792,72 +809,58 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
             // op) {})
             .Case<stablehlo::DivOp>([&args, &transient_buffers](
                                         auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               return std::vector<mx::array>{mx::divide(lhs, rhs)};
             })
             .Case<stablehlo::MaxOp>([&args, &transient_buffers](
                                         auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               return std::vector<mx::array>{mx::maximum(lhs, rhs)};
             })
             .Case<stablehlo::MinOp>([&args, &transient_buffers](
                                         auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               return std::vector<mx::array>{mx::minimum(lhs, rhs)};
             })
             .Case<stablehlo::MulOp>([&args, &transient_buffers](
                                         auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               return std::vector<mx::array>{mx::multiply(lhs, rhs)};
             })
             .Case<stablehlo::PowOp>([&args, &transient_buffers](
                                         auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               return std::vector<mx::array>{mx::power(lhs, rhs)};
             })
             .Case<stablehlo::RemOp>([&args, &transient_buffers](
                                         auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               return std::vector<mx::array>{mx::remainder(lhs, rhs)};
             })
             .Case<stablehlo::ShiftLeftOp>([&args, &transient_buffers](
                                               auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               return std::vector<mx::array>{mx::left_shift(lhs, rhs)};
             })
             /**
@@ -871,54 +874,51 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
             .Case<stablehlo::ShiftRightArithmeticOp,
                   stablehlo::ShiftRightLogicalOp>(
                 [&args, &transient_buffers](auto op) -> StatusOrArrays {
-                  TF_ASSIGN_OR_RETURN(auto lhs,
-                                      getOperandArray(op.getOperand(0), args,
-                                                      transient_buffers));
-                  TF_ASSIGN_OR_RETURN(auto rhs,
-                                      getOperandArray(op.getOperand(1), args,
-                                                      transient_buffers));
+                  TF_ASSIGN_OR_RETURN(
+                      auto lhs,
+                      getOperandArray(op.getLhs(), args, transient_buffers));
+                  TF_ASSIGN_OR_RETURN(
+                      auto rhs,
+                      getOperandArray(op.getRhs(), args, transient_buffers));
                   return std::vector<mx::array>{mx::right_shift(lhs, rhs)};
                 })
-            .Case<stablehlo::SubtractOp>([&args, &transient_buffers](
-                                             auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
-              return std::vector<mx::array>{mx::subtract(lhs, rhs)};
-            })
+            .Case<stablehlo::SubtractOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(
+                      mx::array lhs,
+                      getOperandArray(op.getLhs(), args, transient_buffers));
+                  TF_ASSIGN_OR_RETURN(
+                      mx::array rhs,
+                      getOperandArray(op.getRhs(), args, transient_buffers));
+                  return std::vector<mx::array>{mx::subtract(lhs, rhs)};
+                })
 
             // Handle StableHLO binary logical elementwise ops
             .Case<stablehlo::AndOp>([&args, &transient_buffers](
                                         auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               return std::vector<mx::array>{mx::logical_and(lhs, rhs)};
             })
             .Case<stablehlo::OrOp>([&args, &transient_buffers](
                                        auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
-              return std::vector<mx::array>{mx::logical_or(lhs, rhs)};
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
+              return std::vector<mx::array>{mx::astype(
+                  mx::logical_or(lhs, rhs),
+                  dtypeFromType(mlir::cast<ShapedType>(op.getResult().getType())
+                                    .getElementType()))};
             })
             .Case<stablehlo::XorOp>([&args, &transient_buffers](
                                         auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               return std::vector<mx::array>{mx::bitwise_xor(lhs, rhs)};
             })
 
@@ -991,12 +991,10 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
 
             .Case<stablehlo::CompareOp>([&args, &transient_buffers](
                                             auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               switch (op.getComparisonDirection()) {
                 case ComparisonDirection::NE:
                   return std::vector<mx::array>{mx::not_equal(lhs, rhs)};
@@ -1035,14 +1033,70 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
               return std::vector<mx::array>{
                   mx::slice(operand, start_indices, limit_indices, strides)};
             })
-            // .Case<stablehlo::DynamicSliceOp>([](auto op) {})
-            // .Case<stablehlo::DynamicUpdateSliceOp>([](auto op) {})
+            .Case<stablehlo::DynamicSliceOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(mx::array operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  auto op_start_indices = op.getStartIndices();
+                  std::vector<mx::array> start_indices_list;
+                  for (Value val : op_start_indices) {
+                    TF_ASSIGN_OR_RETURN(
+                        mx::array indice_value,
+                        getOperandArray(val, args, transient_buffers));
+                    start_indices_list.emplace_back(indice_value);
+                  }
+                  mx::array start_indices = mx::concatenate(start_indices_list);
+                  std::vector<int> axes;
+                  axes.resize(operand.ndim());
+                  std::iota(axes.begin(), axes.end(), 0);
+                  std::vector<int32_t> slice_sizes;
+                  for (auto i = 0; i < op.getSliceSizes().size(); i++) {
+                    slice_sizes.push_back(
+                        static_cast<int32_t>(op.getSliceSizes()[i]));
+                  }
+                  return std::vector<mx::array>{
+                      mx::slice(operand, start_indices, axes, slice_sizes)};
+                })
+            .Case<stablehlo::DynamicUpdateSliceOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(auto operand,
+                                      getOperandArray(op.getOperand(), args,
+                                                      transient_buffers));
+                  TF_ASSIGN_OR_RETURN(
+                      auto update,
+                      getOperandArray(op.getUpdate(), args, transient_buffers));
+                  auto op_start_indices = op.getStartIndices();
+                  std::vector<mx::array> start_indices_list;
+                  for (Value val : op_start_indices) {
+                    TF_ASSIGN_OR_RETURN(
+                        mx::array indice_value,
+                        getOperandArray(val, args, transient_buffers));
+                    start_indices_list.emplace_back(indice_value);
+                  }
+                  mx::array start_indices = mx::concatenate(start_indices_list);
+                  std::vector<int32_t> axes;
+                  axes.resize(operand.ndim());
+                  std::iota(axes.begin(), axes.end(), 0);
+                  return std::vector<mx::array>{
+                      mx::slice_update(operand, update, start_indices, axes)};
+                })
 
             // Handle StableHLO Other ops
             // .Case<stablehlo::BatchNormGradOp>([](auto op) {})
             // .Case<stablehlo::BatchNormInferenceOp>([](auto op) {})
             // .Case<stablehlo::BatchNormTrainingOp>([](auto op) {})
-            // .Case<stablehlo::BitcastConvertOp>([](auto op) {})
+            .Case<stablehlo::BitcastConvertOp>([&args, &transient_buffers](
+                                                   auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  auto operand,
+                  getOperandArray(op.getOperand(), args, transient_buffers));
+
+              return std::vector<mx::array>{mx::view(
+                  operand,
+                  dtypeFromType(mlir::cast<ShapedType>(op.getResult().getType())
+                                    .getElementType()))};
+            })
             /*
               .Case<stablehlo::BroadcastOp>([](auto op) {})
               Deprecated see:
@@ -1052,11 +1106,30 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
             .Case<stablehlo::BroadcastInDimOp>([&args, &transient_buffers](
                                                    auto op) -> StatusOrArrays {
               TF_ASSIGN_OR_RETURN(
-                  auto operand,
+                  mx::array operand,
                   getOperandArray(op.getOperand(), args, transient_buffers));
+              std::vector<int32_t> target_shape =
+                  getMlxShape(mlir::cast<ShapedType>(op.getResult().getType()));
+
+              // potentially reshape to pad with ones, which allows broadcasting
+              auto min_rank = std::min(operand.ndim(), target_shape.size());
+              if (min_rank == operand.ndim()) {
+                std::vector<int32_t> padded_shape = operand.shape();
+                for (auto i = 0; i < target_shape.size(); i++) {
+                  if (i < min_rank) {
+                    if (padded_shape[i] != target_shape[i])
+                      goto endif;
+                    else
+                      continue;
+                  } else {
+                    padded_shape.push_back(1);
+                  }
+                }
+                operand = mx::reshape(operand, padded_shape);
+              }
+            endif:
               return std::vector<mx::array>{
-                  mx::broadcast_to(operand, getMlxShape(mlir::cast<ShapedType>(
-                                                op.getResult().getType())))};
+                  mx::broadcast_to(operand, target_shape)};
             })
             // .Case<stablehlo::DynamicBroadcastInDimOp>([](auto op) {})
             .Case<stablehlo::CholeskyOp>(
@@ -1105,12 +1178,10 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
             */
             .Case<stablehlo::DotGeneralOp>([&args, &transient_buffers](
                                                auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  auto lhs,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  auto rhs,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto lhs, getOperandArray(op.getLhs(), args,
+                                                            transient_buffers));
+              TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
+                                                            transient_buffers));
               auto lhs_batch_dims =
                   op.getDotDimensionNumbers().getLhsBatchingDimensions();
               auto rhs_batch_dims =
@@ -1186,10 +1257,52 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
                 https://github.com/openxla/stablehlo/pull/2283
             */
             // .Case<stablehlo::FftOp>([](auto op) {})
-            // .Case<stablehlo::GatherOp>([](auto op) {})
+            // TODO (@cryptodeal): fix implementation. Resulting shape matches, but values do not.
+            // .Case<stablehlo::GatherOp>([&args, &transient_buffers](
+            //                                auto op) -> StatusOrArrays {
+            //   TF_ASSIGN_OR_RETURN(
+            //       mx::array operand,
+            //       getOperandArray(op.getOperand(), args, transient_buffers));
+            //   TF_ASSIGN_OR_RETURN(mx::array start_indices,
+            //                       getOperandArray(op.getStartIndices(), args,
+            //                                       transient_buffers));
+
+            //   auto dimension_numbers = op.getDimensionNumbers();
+            //   // Dimensions to preserve
+            //   auto offset_dims = dimension_numbers.getOffsetDims();
+            //   // Dimensions to collapse
+            //   auto collapsed_slice_dims =
+            //       dimension_numbers.getCollapsedSliceDims();
+            //   // Mapping of start_indices to operand
+            //   auto start_index_map = dimension_numbers.getStartIndexMap();
+            //   std::vector<int> slice_sizes;
+            //   for (auto size : op.getSliceSizes()) {
+            //     slice_sizes.push_back(static_cast<int>(size));
+            //   }
+
+            //   // Ensure start_indices has correct shape
+            //   while (start_indices.ndim() < operand.ndim()) {
+            //     start_indices = mx::expand_dims(start_indices, -1);
+            //   }
+
+            //   for (auto i = 0; i < start_index_map.size(); i++) {
+            //     auto gather_dim = start_index_map[i];
+            //     // Expand indices to match operand shape
+            //     auto index_shape = start_indices.shape();
+            //     // Remove trailing singleton dim
+            //     index_shape.pop_back();
+            //     std::cout << "calculating slice_indices" << std::endl;
+            //     auto slice_indices = mx::take(start_indices, i, -1);
+               
+            //     // Perform gather along the required axis
+            //     operand = mx::gather(operand, slice_indices, gather_dim,
+            //                          slice_sizes);
+            //   }
+            //   return std::vector<mx::array>{operand};
+            // })
             .Case<stablehlo::GetDimensionSizeOp>(
                 [&args, &transient_buffers](auto op) -> StatusOrArrays {
-                  TF_ASSIGN_OR_RETURN(auto operand,
+                  TF_ASSIGN_OR_RETURN(mx::array operand,
                                       getOperandArray(op.getOperand(), args,
                                                       transient_buffers));
                   return std::vector<mx::array>{
@@ -1206,8 +1319,39 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
                                                op.getResult().getType())))};
                 })
             // .Case<stablehlo::DynamicReshapeOp>([](auto op) {})
-            // .Case<stablehlo::ScatterOp>([&transient_buffers, &operands](auto
-            // op) {
+            // .Case<stablehlo::ScatterOp>([&args, &transient_buffers](
+            //                                 auto op) -> StatusOrArrays {
+            //   std::vector<mx::array> inputs;
+            //   for (Value val : op.getInputs()) {
+            //     TF_ASSIGN_OR_RETURN(
+            //         mx::array input_array,
+            //         getOperandArray(val, args, transient_buffers));
+            //     inputs.emplace_back(input_array);
+            //   }
+            //   // std::cout << std::to_string(inputs.size()) << " inputs"
+            //   //           << std::endl;
+            //   TF_ASSIGN_OR_RETURN(mx::array scatter_indices,
+            //                       getOperandArray(op.getScatterIndices(),
+            //                       args,
+            //                                       transient_buffers));
+            //   std::vector<mx::array> updates;
+            //   for (Value val : op.getUpdates()) {
+            //     TF_ASSIGN_OR_RETURN(
+            //         mx::array update_array,
+            //         getOperandArray(val, args, transient_buffers));
+            //     updates.emplace_back(update_array);
+            //   }
+            //   // std::cout << std::to_string(updates.size()) << " updates"
+            //   //           << std::endl;
+
+            //   func::Func update_computation = op.getUpdateComputation();
+            //   for (auto i = 0; i < inputs.size(); i++) {
+            //     Block& body_block = op.getUpdateComputation().front();
+            //     body_block.dump();
+            //   }
+
+            //   return absl::UnimplementedError("ScatterOp not implemented
+            //   yet");
             // })
             .Case<stablehlo::SelectOp>([&args, &transient_buffers](
                                            auto op) -> StatusOrArrays {
@@ -1246,34 +1390,62 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
             // .Case<stablehlo::CrossReplicaSumOp>([](auto op) {})
 
             // Handle StableHLO RNG ops
-            .Case<stablehlo::RngOp>([&args, &transient_buffers](
-                                        auto op) -> StatusOrArrays {
-              TF_ASSIGN_OR_RETURN(
-                  mx::array a,
-                  getOperandArray(op.getOperand(0), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  mx::array b,
-                  getOperandArray(op.getOperand(1), args, transient_buffers));
-              TF_ASSIGN_OR_RETURN(
-                  mx::array dims,
-                  getOperandArray(op.getOperand(2), args, transient_buffers));
-              auto shape_buffer = dims.data<int64_t>();
-              std::vector<int32_t> shape;
-              for (auto i = 0; i < dims.size(); i++) {
-                shape.push_back(static_cast<int32_t>(shape_buffer[i]));
-              }
-              std::vector<mx::array> res;
-              if (op.getRngDistribution() == RngDistribution::UNIFORM) {
-                return std::vector<mx::array>{
-                    mx::random::uniform(a, b, shape, a.dtype())};
-              } else {
-                return std::vector<mx::array>{mx::random::normal(
-                    shape, a.dtype(),
-                    (mx::astype(a, mx::float32)).item<float>(),
-                    (mx::astype(b, mx::float32)).item<float>())};
-              }
-            })
-            // .Case<stablehlo::RngBitGeneratorOp>([](auto op) {})
+            .Case<stablehlo::RngOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  // op.dump();
+                  TF_ASSIGN_OR_RETURN(
+                      mx::array a,
+                      getOperandArray(op.getA(), args, transient_buffers));
+                  TF_ASSIGN_OR_RETURN(
+                      mx::array b,
+                      getOperandArray(op.getB(), args, transient_buffers));
+                  TF_ASSIGN_OR_RETURN(
+                      mx::array dims,
+                      getOperandArray(op.getShape(), args, transient_buffers));
+                  auto shape_buffer = dims.data<int64_t>();
+                  std::vector<int32_t> shape;
+                  for (auto i = 0; i < dims.size(); i++) {
+                    shape.push_back(static_cast<int32_t>(shape_buffer[i]));
+                  }
+                  std::vector<mx::array> res;
+                  if (op.getRngDistribution() == RngDistribution::UNIFORM) {
+                    return std::vector<mx::array>{
+                        mx::random::uniform(a, b, shape, a.dtype())};
+                  } else {
+                    return std::vector<mx::array>{mx::random::normal(
+                        shape, a.dtype(),
+                        (mx::astype(a, mx::float32)).item<float>(),
+                        (mx::astype(b, mx::float32)).item<float>())};
+                  }
+                })
+            .Case<stablehlo::RngBitGeneratorOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(mx::array initial_state,
+                                      getOperandArray(op.getInitialState(),
+                                                      args, transient_buffers));
+                  initial_state = mx::astype(initial_state, mx::uint32);
+                  // whereas stablehlo prng state is an array of `uint64_t`, mlx
+                  // is an array of `uint32_t`
+                  auto output_type =
+                      mlir::cast<ShapedType>(op.getOutput().getType());
+                  std::vector<int32_t> out_shape;
+                  for (auto dim : output_type.getShape()) {
+                    out_shape.push_back(static_cast<int32_t>(dim));
+                  }
+                  StatusOrInt element_width =
+                      getByteWidth(output_type.getElementType());
+                  if (!element_width.ok()) {
+                    return element_width.status();
+                  }
+                  // TODO (@cryptodeal): implement `THREE_FRY` and `PHILOX`
+                  // algos
+                  auto res = mx::random::bits(out_shape, *element_width,
+                                              initial_state);
+                  return std::vector<mx::array>{
+                      mx::astype(mx::random::split(initial_state).second,
+                                 mx::uint64),
+                      res};
+                })
 
             // Handle StableHLO Quantize ops
             // .Case<stablehlo::UniformQuantizeOp>([](auto op) {})
@@ -1387,8 +1559,8 @@ class MlirLoadedExecutable : public PjRtLoadedExecutable {
 
     // holds intermediary results of operation calls.
     std::unordered_map<Operation*, mx::array> transient_buffers;
-    std::cout << std::endl << std::endl;
-    module.dump();
+    // std::cout << std::endl << std::endl;
+    // module.dump();
     auto main = module.lookupSymbol<mlir::func::FuncOp>("main");
     TF_ASSIGN_OR_RETURN(auto mlx_res, evalFunc(module, main, block_arguments));
 
