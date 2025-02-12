@@ -866,13 +866,11 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
             /**
              * Per Metal Spec:
              * For the right-shift operator, if E1 has an unsigned type or if
-             E1
-             * has a signed type and a nonnegative value, the vacated bits are
-             * filled with zeros. If E1 has a signed type and a negative value,
-             * the vacated bits are filled with ones.
+             * E1 has a signed type and a nonnegative value, the vacated bits
+             * are filled with zeros. If E1 has a signed type and a negative
+             * value, the vacated bits are filled with ones.
              */
-            .Case<stablehlo::ShiftRightArithmeticOp,
-                  stablehlo::ShiftRightLogicalOp>(
+            .Case<stablehlo::ShiftRightArithmeticOp>(
                 [&args, &transient_buffers](auto op) -> StatusOrArrays {
                   TF_ASSIGN_OR_RETURN(
                       auto lhs,
@@ -881,6 +879,43 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
                       auto rhs,
                       getOperandArray(op.getRhs(), args, transient_buffers));
                   return std::vector<mx::array>{mx::right_shift(lhs, rhs)};
+                })
+            // Ensures that we bitcast to `uint` type before performing the
+            // right shift. Should ensure that vacated bits are zero populated.
+            .Case<stablehlo::ShiftRightLogicalOp>(
+                [&args, &transient_buffers](auto op) -> StatusOrArrays {
+                  TF_ASSIGN_OR_RETURN(
+                      auto lhs,
+                      getOperandArray(op.getLhs(), args, transient_buffers));
+                  auto lhs_dtype = lhs.dtype();
+                  TF_ASSIGN_OR_RETURN(
+                      auto rhs,
+                      getOperandArray(op.getRhs(), args, transient_buffers));
+                  if (mx::kindof(lhs_dtype) != mx::Dtype::Kind::u) {
+                    auto target_dtype = lhs_dtype;
+                    switch (lhs_dtype.size()) {
+                      case 1:
+                        target_dtype = mx::uint8;
+                        break;
+                      case 2:
+                        target_dtype = mx::uint16;
+                        break;
+                      case 4:
+                        target_dtype = mx::uint32;
+                        break;
+                      case 8:
+                        target_dtype = mx::uint64;
+                        break;
+                      default:
+                        break;
+                    }
+                    return std::vector<mx::array>{
+                        mx::view(mx::right_shift(mx::view(lhs, target_dtype),
+                                                 mx::astype(rhs, target_dtype)),
+                                 lhs_dtype)};
+                  } else {
+                    return std::vector<mx::array>{mx::right_shift(lhs, rhs)};
+                  }
                 })
             .Case<stablehlo::SubtractOp>(
                 [&args, &transient_buffers](auto op) -> StatusOrArrays {
@@ -1257,49 +1292,83 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
                 https://github.com/openxla/stablehlo/pull/2283
             */
             // .Case<stablehlo::FftOp>([](auto op) {})
-            // TODO (@cryptodeal): fix implementation. Resulting shape matches, but values do not.
-            // .Case<stablehlo::GatherOp>([&args, &transient_buffers](
-            //                                auto op) -> StatusOrArrays {
-            //   TF_ASSIGN_OR_RETURN(
-            //       mx::array operand,
-            //       getOperandArray(op.getOperand(), args, transient_buffers));
-            //   TF_ASSIGN_OR_RETURN(mx::array start_indices,
-            //                       getOperandArray(op.getStartIndices(), args,
-            //                                       transient_buffers));
+            // TODO (@cryptodeal): fix implementation; works for some tests,
+            // others it pulls correct values, but in the wrong order.
+            .Case<stablehlo::GatherOp>([&args, &transient_buffers](
+                                           auto op) -> StatusOrArrays {
+              TF_ASSIGN_OR_RETURN(
+                  mx::array operand,
+                  getOperandArray(op.getOperand(), args, transient_buffers));
+              TF_ASSIGN_OR_RETURN(mx::array start_indices,
+                                  getOperandArray(op.getStartIndices(), args,
+                                                  transient_buffers));
+              auto dimension_numbers = op.getDimensionNumbers();
+              auto index_vector_dim = dimension_numbers.getIndexVectorDim();
+              auto start_index_map = dimension_numbers.getStartIndexMap();
+              auto collapsed_slice_dims =
+                  dimension_numbers.getCollapsedSliceDims();
+              auto slice_sizes = op.getSliceSizes();
 
-            //   auto dimension_numbers = op.getDimensionNumbers();
-            //   // Dimensions to preserve
-            //   auto offset_dims = dimension_numbers.getOffsetDims();
-            //   // Dimensions to collapse
-            //   auto collapsed_slice_dims =
-            //       dimension_numbers.getCollapsedSliceDims();
-            //   // Mapping of start_indices to operand
-            //   auto start_index_map = dimension_numbers.getStartIndexMap();
-            //   std::vector<int> slice_sizes;
-            //   for (auto size : op.getSliceSizes()) {
-            //     slice_sizes.push_back(static_cast<int>(size));
-            //   }
+              // Ensure start_indices has the correct shape
+              mx::array adjusted_start_indices = start_indices;
+              if (index_vector_dim == start_indices.ndim()) {
+                adjusted_start_indices = mx::expand_dims(start_indices, -1);
+              }
 
-            //   // Ensure start_indices has correct shape
-            //   while (start_indices.ndim() < operand.ndim()) {
-            //     start_indices = mx::expand_dims(start_indices, -1);
-            //   }
+              // Create a full starting index tensor (sin) by scattering the
+              // start indices
+              std::vector<int> sin_shape = adjusted_start_indices.shape();
+              sin_shape.back() = operand.ndim();
+              mx::array sin = mx::zeros(sin_shape, mx::int64);
+              for (size_t i = 0; i < start_index_map.size(); ++i) {
+                std::vector<int32_t> a_start(adjusted_start_indices.ndim(), 0);
+                a_start[a_start.size() - 1] = static_cast<int32_t>(i);
+                std::vector<int32_t> a_stop = adjusted_start_indices.shape();
+                a_stop[a_stop.size() - 1] = static_cast<int32_t>(i + 1);
+                std::vector<int32_t> sin_start(sin.ndim(), 0);
+                sin_start[sin_start.size() - 1] =
+                    static_cast<int32_t>(start_index_map[i]);
+                std::vector<int32_t> sin_stop = sin.shape();
+                sin_stop[sin_stop.size() - 1] =
+                    static_cast<int32_t>(start_index_map[i] + 1);
+                sin = mx::slice_update(
+                    sin, mx::slice(adjusted_start_indices, a_start, a_stop),
+                    sin_start, sin_stop);
+              }
 
-            //   for (auto i = 0; i < start_index_map.size(); i++) {
-            //     auto gather_dim = start_index_map[i];
-            //     // Expand indices to match operand shape
-            //     auto index_shape = start_indices.shape();
-            //     // Remove trailing singleton dim
-            //     index_shape.pop_back();
-            //     std::cout << "calculating slice_indices" << std::endl;
-            //     auto slice_indices = mx::take(start_indices, i, -1);
-               
-            //     // Perform gather along the required axis
-            //     operand = mx::gather(operand, slice_indices, gather_dim,
-            //                          slice_sizes);
-            //   }
-            //   return std::vector<mx::array>{operand};
-            // })
+              // Adjust slice sizes to account for collapsed dimensions
+              std::vector<int> adjusted_slice_sizes;
+              for (size_t i = 0; i < slice_sizes.size(); ++i) {
+                if (std::find(collapsed_slice_dims.begin(),
+                              collapsed_slice_dims.end(),
+                              i) == collapsed_slice_dims.end()) {
+                  adjusted_slice_sizes.push_back(slice_sizes[i]);
+                }
+              }
+
+              // Gather slices using advanced indexing
+              std::vector<mx::array> slices;
+              int num_slices = sin.size() / sin.shape().back();
+              for (int i = 0; i < num_slices; ++i) {
+                std::vector<int32_t> start;
+                std::vector<int32_t> stop;
+                for (int j = 0; j < sin.shape().back(); ++j) {
+                  int idx = mx::slice(sin, {i, j}, {i + 1, j + 1}).item<int>();
+                  start.emplace_back(idx);
+                  stop.emplace_back(idx + slice_sizes[j]);
+                }
+                slices.push_back(mx::slice(operand, start, stop));
+              }
+
+              // Stack slices into output shape
+              std::vector<int> output_shape = adjusted_start_indices.shape();
+              output_shape.pop_back();
+              output_shape.insert(output_shape.end(),
+                                  adjusted_slice_sizes.begin(),
+                                  adjusted_slice_sizes.end());
+              return std::vector<mx::array>{
+                  mx::reshape(mx::stack(slices), output_shape)};
+            })
             .Case<stablehlo::GetDimensionSizeOp>(
                 [&args, &transient_buffers](auto op) -> StatusOrArrays {
                   TF_ASSIGN_OR_RETURN(mx::array operand,
@@ -1555,7 +1624,8 @@ class MlirLoadedExecutable : public PjRtLoadedExecutable {
 
     // TODO(@cryptodeal): operations can return multiple results,
     // will need to switch to something along the lines of
-    // std::unordered_map<Operation*, std::vector<mx::array>> transient_buffers;
+    // std::unordered_map<Operation*, std::vector<mx::array>>
+    // transient_buffers;
 
     // holds intermediary results of operation calls.
     std::unordered_map<Operation*, mx::array> transient_buffers;
@@ -1639,8 +1709,8 @@ class MlirLoadedExecutable : public PjRtLoadedExecutable {
 
     std::optional<PjRtFuture<>> future;
     if (fill_future) {
-      // Synchronous! To make async, this would need to return a future that is
-      // ready when the computation is done.
+      // Synchronous! To make async, this would need to return a future that
+      // is ready when the computation is done.
       future = PjRtFuture<>(absl::OkStatus());
     }
     return PjRtLoadedExecutable::Result{future, std::move(buffer_results)};
