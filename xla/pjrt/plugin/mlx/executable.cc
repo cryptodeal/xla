@@ -875,10 +875,31 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
                   TF_ASSIGN_OR_RETURN(
                       auto lhs,
                       getOperandArray(op.getLhs(), args, transient_buffers));
+                  auto lhs_dtype = lhs.dtype();
                   TF_ASSIGN_OR_RETURN(
                       auto rhs,
                       getOperandArray(op.getRhs(), args, transient_buffers));
-                  return std::vector<mx::array>{mx::right_shift(lhs, rhs)};
+                  auto target_dtype = lhs_dtype;
+                  switch (lhs_dtype.size()) {
+                    case 1:
+                      target_dtype = mx::int8;
+                      break;
+                    case 2:
+                      target_dtype = mx::int16;
+                      break;
+                    case 4:
+                      target_dtype = mx::int32;
+                      break;
+                    case 8:
+                      target_dtype = mx::int64;
+                      break;
+                    default:
+                      break;
+                  }
+                  return std::vector<mx::array>{
+                      mx::view(mx::right_shift(mx::view(lhs, target_dtype),
+                                               mx::astype(rhs, target_dtype)),
+                               lhs_dtype)};
                 })
             // Ensures that we bitcast to `uint` type before performing the
             // right shift. Should ensure that vacated bits are zero populated.
@@ -891,31 +912,27 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
                   TF_ASSIGN_OR_RETURN(
                       auto rhs,
                       getOperandArray(op.getRhs(), args, transient_buffers));
-                  if (mx::kindof(lhs_dtype) != mx::Dtype::Kind::u) {
-                    auto target_dtype = lhs_dtype;
-                    switch (lhs_dtype.size()) {
-                      case 1:
-                        target_dtype = mx::uint8;
-                        break;
-                      case 2:
-                        target_dtype = mx::uint16;
-                        break;
-                      case 4:
-                        target_dtype = mx::uint32;
-                        break;
-                      case 8:
-                        target_dtype = mx::uint64;
-                        break;
-                      default:
-                        break;
-                    }
-                    return std::vector<mx::array>{
-                        mx::view(mx::right_shift(mx::view(lhs, target_dtype),
-                                                 mx::astype(rhs, target_dtype)),
-                                 lhs_dtype)};
-                  } else {
-                    return std::vector<mx::array>{mx::right_shift(lhs, rhs)};
+                  auto target_dtype = lhs_dtype;
+                  switch (lhs_dtype.size()) {
+                    case 1:
+                      target_dtype = mx::uint8;
+                      break;
+                    case 2:
+                      target_dtype = mx::uint16;
+                      break;
+                    case 4:
+                      target_dtype = mx::uint32;
+                      break;
+                    case 8:
+                      target_dtype = mx::uint64;
+                      break;
+                    default:
+                      break;
                   }
+                  return std::vector<mx::array>{
+                      mx::view(mx::right_shift(mx::view(lhs, target_dtype),
+                                               mx::astype(rhs, target_dtype)),
+                               lhs_dtype)};
                 })
             .Case<stablehlo::SubtractOp>(
                 [&args, &transient_buffers](auto op) -> StatusOrArrays {
@@ -935,7 +952,11 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
                                                             transient_buffers));
               TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
                                                             transient_buffers));
-              return std::vector<mx::array>{mx::logical_and(lhs, rhs)};
+              if (mx::kindof(lhs.dtype()) == mx::Dtype::Kind::b) {
+                return std::vector<mx::array>{mx::logical_and(lhs, rhs)};
+              } else {
+                return std::vector<mx::array>{mx::bitwise_and(lhs, rhs)};
+              }
             })
             .Case<stablehlo::OrOp>([&args, &transient_buffers](
                                        auto op) -> StatusOrArrays {
@@ -943,10 +964,12 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
                                                             transient_buffers));
               TF_ASSIGN_OR_RETURN(auto rhs, getOperandArray(op.getRhs(), args,
                                                             transient_buffers));
-              return std::vector<mx::array>{mx::astype(
-                  mx::logical_or(lhs, rhs),
-                  dtypeFromType(mlir::cast<ShapedType>(op.getResult().getType())
-                                    .getElementType()))};
+
+              if (mx::kindof(lhs.dtype()) == mx::Dtype::Kind::b) {
+                return std::vector<mx::array>{mx::logical_or(lhs, rhs)};
+              } else {
+                return std::vector<mx::array>{mx::bitwise_or(lhs, rhs)};
+              }
             })
             .Case<stablehlo::XorOp>([&args, &transient_buffers](
                                         auto op) -> StatusOrArrays {
@@ -1302,12 +1325,82 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
               TF_ASSIGN_OR_RETURN(mx::array start_indices,
                                   getOperandArray(op.getStartIndices(), args,
                                                   transient_buffers));
+
+              std::cout << "Start Indices: " << start_indices << std::endl;
               auto dimension_numbers = op.getDimensionNumbers();
-              auto index_vector_dim = dimension_numbers.getIndexVectorDim();
-              auto start_index_map = dimension_numbers.getStartIndexMap();
+
+              auto offset_dims = dimension_numbers.getOffsetDims();
               auto collapsed_slice_dims =
                   dimension_numbers.getCollapsedSliceDims();
+              auto operand_batching_dims =
+                  dimension_numbers.getOperandBatchingDims();
+              auto start_indices_batching_dims =
+                  dimension_numbers.getStartIndicesBatchingDims();
+              auto start_index_map = dimension_numbers.getStartIndexMap();
+              auto index_vector_dim = dimension_numbers.getIndexVectorDim();
               auto slice_sizes = op.getSliceSizes();
+
+              // DEBUG
+              // {
+              //   std::cout << "Operand Shape: { ";
+              //   for (auto i : operand.shape()) {
+              //     std::cout << std::to_string(i) << ", ";
+              //   }
+              //   std::cout << "}" << std::endl;
+              //   std::cout << "Operand: " << operand << std::endl;
+
+              //   std::cout << "Start Indices Shape: { ";
+              //   for (auto i : start_indices.shape()) {
+              //     std::cout << std::to_string(i) << ", ";
+              //   }
+              //   std::cout << "}" << std::endl;
+              //   std::cout << "Start Indices: ";
+              //   start_indices.eval();
+              //   auto* data = start_indices.data<int32_t>();
+              //   for (int i = 0; i < start_indices.data_size(); ++i) {
+              //     std::cout << std::to_string(data[i]) << ", ";
+              //   }
+              //   std::cout << std::endl;
+              //   std::cout << "offset_dims = { ";
+              //   for (auto i : start_index_map) {
+              //     std::cout << std::to_string(i) << ", ";
+              //   }
+              //   std::cout << "}" << std::endl;
+
+              //   std::cout << "collapsed_slice_dims = { ";
+              //   for (auto i : collapsed_slice_dims) {
+              //     std::cout << std::to_string(i) << ", ";
+              //   }
+              //   std::cout << "}" << std::endl;
+
+              //   std::cout << "operand_batching_dims = { ";
+              //   for (auto i : operand_batching_dims) {
+              //     std::cout << std::to_string(i) << ", ";
+              //   }
+              //   std::cout << "}" << std::endl;
+
+              //   std::cout << "start_indices_batching_dims = { ";
+              //   for (auto i : start_indices_batching_dims) {
+              //     std::cout << std::to_string(i) << ", ";
+              //   }
+              //   std::cout << "}" << std::endl;
+
+              //   std::cout << "start_index_map = { ";
+              //   for (auto i : start_index_map) {
+              //     std::cout << std::to_string(i) << ", ";
+              //   }
+              //   std::cout << "}" << std::endl;
+
+              //   std::cout << "index_vector_dim = "
+              //             << std::to_string(index_vector_dim) << std::endl;
+
+              //   std::cout << "slice_sizes = { ";
+              //   for (auto i : slice_sizes) {
+              //     std::cout << std::to_string(i) << ", ";
+              //   }
+              //   std::cout << "}" << std::endl;
+              // }
+              // END DEBUG
 
               // Ensure start_indices has the correct shape
               mx::array adjusted_start_indices = start_indices;
@@ -1319,7 +1412,7 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
               // start indices
               std::vector<int> sin_shape = adjusted_start_indices.shape();
               sin_shape.back() = operand.ndim();
-              mx::array sin = mx::zeros(sin_shape, mx::int64);
+              mx::array sin = mx::zeros(sin_shape, mx::int32);
               for (size_t i = 0; i < start_index_map.size(); ++i) {
                 std::vector<int32_t> a_start(adjusted_start_indices.ndim(), 0);
                 a_start[a_start.size() - 1] = static_cast<int32_t>(i);
@@ -1630,7 +1723,7 @@ class MlirLoadedExecutable : public PjRtLoadedExecutable {
     // holds intermediary results of operation calls.
     std::unordered_map<Operation*, mx::array> transient_buffers;
     // std::cout << std::endl << std::endl;
-    // module.dump();
+    module.dump();
     auto main = module.lookupSymbol<mlir::func::FuncOp>("main");
     TF_ASSIGN_OR_RETURN(auto mlx_res, evalFunc(module, main, block_arguments));
 
