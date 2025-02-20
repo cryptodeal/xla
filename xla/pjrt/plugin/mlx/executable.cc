@@ -18,6 +18,8 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 #include <type_traits>
+#include <range/v3/view/cartesian_product.hpp>
+#include <range/v3/view/indices.hpp>
 
 // TODO(@cryptodeal): might need to update `BUILD`
 #include "mlir/IR/Visitors.h"
@@ -58,6 +60,50 @@ namespace mx = mlx::core;
 typedef absl::StatusOr<mx::array> StatusOrArray;
 typedef absl::StatusOr<std::vector<mx::array>> StatusOrArrays;
 typedef absl::StatusOr<int> StatusOrInt;
+
+// ZML supports up to 8 dimensions
+auto index_space(const std::vector<int32_t>& dims) {
+  using namespace ranges;
+  // `MAX_RANK` for zml is 8
+  std::vector<int32_t> used_dims(8, 1);
+  std::copy(dims.begin(), dims.end(), used_dims.begin());
+  return views::cartesian_product(
+      views::indices(used_dims[0]), views::indices(used_dims[1]),
+      views::indices(used_dims[2]), views::indices(used_dims[3]),
+      views::indices(used_dims[4]), views::indices(used_dims[5]),
+      views::indices(used_dims[6]), views::indices(used_dims[7]));
+}
+
+template <class Tuple,
+          class T = std::decay_t<std::tuple_element_t<0, std::decay_t<Tuple>>>>
+std::vector<T> to_vector(Tuple&& tuple) {
+  return std::apply(
+      [](auto&&... elems) {
+        return std::vector<T>{std::forward<decltype(elems)>(elems)...};
+      },
+      std::forward<Tuple>(tuple));
+}
+
+template <class Tuple,
+          class T = std::decay_t<std::tuple_element_t<0, std::decay_t<Tuple>>>>
+std::vector<T> to_vector(Tuple&& tuple, size_t size) {
+  std::vector<T> result = to_vector(tuple);
+  result.resize(size);
+  return result;
+}
+
+int32_t currentStartIndex(mx::array& index_scalar) {
+  switch (index_scalar.dtype()) {
+    case mx::int64:
+      return static_cast<int32_t>(index_scalar.item<int64_t>());
+    case mx::int16:
+      return static_cast<int32_t>(index_scalar.item<int16_t>());
+    case mx::int8:
+      return static_cast<int32_t>(index_scalar.item<int8_t>());
+    default:
+      return index_scalar.item<int32_t>();
+  }
+}
 
 namespace mlir::stablehlo {
 
@@ -1326,9 +1372,7 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
                                   getOperandArray(op.getStartIndices(), args,
                                                   transient_buffers));
 
-              std::cout << "Start Indices: " << start_indices << std::endl;
               auto dimension_numbers = op.getDimensionNumbers();
-
               auto offset_dims = dimension_numbers.getOffsetDims();
               auto collapsed_slice_dims =
                   dimension_numbers.getCollapsedSliceDims();
@@ -1340,127 +1384,117 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
               auto index_vector_dim = dimension_numbers.getIndexVectorDim();
               auto slice_sizes = op.getSliceSizes();
 
-              // DEBUG
-              // {
-              //   std::cout << "Operand Shape: { ";
-              //   for (auto i : operand.shape()) {
-              //     std::cout << std::to_string(i) << ", ";
-              //   }
-              //   std::cout << "}" << std::endl;
-              //   std::cout << "Operand: " << operand << std::endl;
+              std::vector<int32_t> result_shape =
+                  getMlxShape(mlir::cast<ShapedType>(op.getResult().getType()));
 
-              //   std::cout << "Start Indices Shape: { ";
-              //   for (auto i : start_indices.shape()) {
-              //     std::cout << std::to_string(i) << ", ";
-              //   }
-              //   std::cout << "}" << std::endl;
-              //   std::cout << "Start Indices: ";
-              //   start_indices.eval();
-              //   auto* data = start_indices.data<int32_t>();
-              //   for (int i = 0; i < start_indices.data_size(); ++i) {
-              //     std::cout << std::to_string(data[i]) << ", ";
-              //   }
-              //   std::cout << std::endl;
-              //   std::cout << "offset_dims = { ";
-              //   for (auto i : start_index_map) {
-              //     std::cout << std::to_string(i) << ", ";
-              //   }
-              //   std::cout << "}" << std::endl;
-
-              //   std::cout << "collapsed_slice_dims = { ";
-              //   for (auto i : collapsed_slice_dims) {
-              //     std::cout << std::to_string(i) << ", ";
-              //   }
-              //   std::cout << "}" << std::endl;
-
-              //   std::cout << "operand_batching_dims = { ";
-              //   for (auto i : operand_batching_dims) {
-              //     std::cout << std::to_string(i) << ", ";
-              //   }
-              //   std::cout << "}" << std::endl;
-
-              //   std::cout << "start_indices_batching_dims = { ";
-              //   for (auto i : start_indices_batching_dims) {
-              //     std::cout << std::to_string(i) << ", ";
-              //   }
-              //   std::cout << "}" << std::endl;
-
-              //   std::cout << "start_index_map = { ";
-              //   for (auto i : start_index_map) {
-              //     std::cout << std::to_string(i) << ", ";
-              //   }
-              //   std::cout << "}" << std::endl;
-
-              //   std::cout << "index_vector_dim = "
-              //             << std::to_string(index_vector_dim) << std::endl;
-
-              //   std::cout << "slice_sizes = { ";
-              //   for (auto i : slice_sizes) {
-              //     std::cout << std::to_string(i) << ", ";
-              //   }
-              //   std::cout << "}" << std::endl;
-              // }
-              // END DEBUG
-
-              // Ensure start_indices has the correct shape
-              mx::array adjusted_start_indices = start_indices;
-              if (index_vector_dim == start_indices.ndim()) {
-                adjusted_start_indices = mx::expand_dims(start_indices, -1);
-              }
-
-              // Create a full starting index tensor (sin) by scattering the
-              // start indices
-              std::vector<int> sin_shape = adjusted_start_indices.shape();
-              sin_shape.back() = operand.ndim();
-              mx::array sin = mx::zeros(sin_shape, mx::int32);
-              for (size_t i = 0; i < start_index_map.size(); ++i) {
-                std::vector<int32_t> a_start(adjusted_start_indices.ndim(), 0);
-                a_start[a_start.size() - 1] = static_cast<int32_t>(i);
-                std::vector<int32_t> a_stop = adjusted_start_indices.shape();
-                a_stop[a_stop.size() - 1] = static_cast<int32_t>(i + 1);
-                std::vector<int32_t> sin_start(sin.ndim(), 0);
-                sin_start[sin_start.size() - 1] =
-                    static_cast<int32_t>(start_index_map[i]);
-                std::vector<int32_t> sin_stop = sin.shape();
-                sin_stop[sin_stop.size() - 1] =
-                    static_cast<int32_t>(start_index_map[i] + 1);
-                sin = mx::slice_update(
-                    sin, mx::slice(adjusted_start_indices, a_start, a_stop),
-                    sin_start, sin_stop);
-              }
-
-              // Adjust slice sizes to account for collapsed dimensions
-              std::vector<int> adjusted_slice_sizes;
-              for (size_t i = 0; i < slice_sizes.size(); ++i) {
-                if (std::find(collapsed_slice_dims.begin(),
-                              collapsed_slice_dims.end(),
-                              i) == collapsed_slice_dims.end()) {
-                  adjusted_slice_sizes.push_back(slice_sizes[i]);
+              // Calculate batch dims
+              std::vector<int32_t> batch_dims;
+              for (int64_t i = 0; i < result_shape.size(); i++) {
+                if (std::find(offset_dims.begin(), offset_dims.end(), i) ==
+                    offset_dims.end()) {
+                  batch_dims.emplace_back(static_cast<int32_t>(i));
                 }
               }
+              mx::array result = mx::zeros(result_shape, operand.dtype());
 
-              // Gather slices using advanced indexing
-              std::vector<mx::array> slices;
-              int num_slices = sin.size() / sin.shape().back();
-              for (int i = 0; i < num_slices; ++i) {
-                std::vector<int32_t> start;
-                std::vector<int32_t> stop;
-                for (int j = 0; j < sin.shape().back(); ++j) {
-                  int idx = mx::slice(sin, {i, j}, {i + 1, j + 1}).item<int>();
-                  start.emplace_back(idx);
-                  stop.emplace_back(idx + slice_sizes[j]);
+              // Iterate over result index space, populating result
+              for (const auto result_index_tuple : index_space(result_shape)) {
+                std::vector<int32_t> result_index =
+                    to_vector(result_index_tuple, result_shape.size());
+
+                std::vector<int32_t> batch_index(batch_dims.size());
+                for (unsigned i = 0; i < batch_dims.size(); i++) {
+                  batch_index[i] = result_index[batch_dims[i]];
                 }
-                slices.push_back(mx::slice(operand, start, stop));
-              }
 
-              // Stack slices into output shape
-              std::vector<int> output_shape = adjusted_start_indices.shape();
-              output_shape.pop_back();
-              output_shape.insert(output_shape.end(),
-                                  adjusted_slice_sizes.begin(),
-                                  adjusted_slice_sizes.end());
-              return std::vector<mx::array>{
-                  mx::reshape(mx::stack(slices), output_shape)};
+                // Slice start index for the current batch
+                std::vector<int32_t> sin_start(start_indices.ndim());
+                std::vector<int32_t> sin_stop(start_indices.ndim());
+                unsigned batch_idx_count = 0;
+
+                for (auto i = 0; i < start_indices.ndim(); i++) {
+                  if (index_vector_dim == static_cast<int64_t>(i)) {
+                    sin_start[i] = 0;
+                    sin_stop[i] = start_indices.shape(i) + 1;
+                    continue;
+                  }
+                  sin_start[i] = batch_index[batch_idx_count++];
+                  sin_stop[i] = sin_start[i] + 1;
+                }
+                mx::array start_index =
+                    mx::flatten(mx::slice(start_indices, sin_start, sin_stop));
+
+                // Compute full start index
+                std::vector<int32_t> full_start_index(operand.ndim(), 0);
+                for (auto d_start = 0; d_start < start_index_map.size();
+                     d_start++) {
+                  auto d_operand = start_index_map[d_start];
+                  auto index_scalar =
+                      mx::slice(start_index, {d_start}, {d_start + 1});
+                  full_start_index[d_operand] = std::clamp(
+                      currentStartIndex(index_scalar), 0,
+                      operand.shape(d_operand) -
+                          static_cast<int32_t>(slice_sizes[d_operand]));
+                }
+
+                // Compute full batching index
+                std::vector<int32_t> full_batching_index(operand.ndim(), 0);
+                for (auto i_batching = 0;
+                     i_batching < operand_batching_dims.size(); i_batching++) {
+                  auto d_operand =
+                      static_cast<int32_t>(operand_batching_dims[i_batching]);
+                  auto d_start = static_cast<int32_t>(
+                      start_indices_batching_dims[i_batching]);
+                  full_batching_index[d_operand] =
+                      batch_index[d_start - (static_cast<int64_t>(d_start) <
+                                                     index_vector_dim
+                                                 ? 0
+                                                 : 1)];
+                }
+
+                // Compute offset index
+                std::vector<int32_t> offset_index(offset_dims.size());
+                for (unsigned i = 0; i < offset_dims.size(); i++) {
+                  offset_index[i] = result_index[offset_dims[i]];
+                }
+
+                // Compute full offset index
+                std::vector<int32_t> full_offset_index(operand.ndim(), 0);
+                unsigned offset_index_count = 0;
+                for (unsigned i = 0; i < full_offset_index.size(); i++) {
+                  if (std::find(operand_batching_dims.begin(),
+                                operand_batching_dims.end(),
+                                static_cast<int64_t>(i)) !=
+                          operand_batching_dims.end() ||
+                      std::find(collapsed_slice_dims.begin(),
+                                collapsed_slice_dims.end(),
+                                static_cast<int64_t>(i)) !=
+                          collapsed_slice_dims.end()) {
+                    continue;
+                  }
+                  full_offset_index[i] = offset_index[offset_index_count++];
+                }
+
+                std::vector<int32_t> operand_index(operand.ndim());
+                for (unsigned i = 0; i < operand.ndim(); i++) {
+                  operand_index[i] = full_start_index[i] +
+                                     full_batching_index[i] +
+                                     full_offset_index[i];
+                }
+
+                // slice gathered value
+                std::vector<int32_t> operand_stop = operand_index;
+                for (auto& d : operand_stop) d += 1;
+                std::vector<int32_t> result_stop = result_index;
+                for (auto& d : result_stop) d += 1;
+
+                result =
+                    mx::slice_update(result,
+                                     mx::flatten(mx::slice(
+                                         operand, operand_index, operand_stop)),
+                                     result_index, result_stop);
+              }
+              return std::vector<mx::array>{result};
             })
             .Case<stablehlo::GetDimensionSizeOp>(
                 [&args, &transient_buffers](auto op) -> StatusOrArrays {
@@ -1481,17 +1515,110 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
                                                op.getResult().getType())))};
                 })
             // .Case<stablehlo::DynamicReshapeOp>([](auto op) {})
+            .Case<stablehlo::ScatterOp>([&args, &transient_buffers](
+                                            auto op) -> StatusOrArrays {
+              // Get list of input(s)
+              std::vector<mx::array> inputs;
+              for (Value val : op.getInputs()) {
+                TF_ASSIGN_OR_RETURN(
+                    mx::array input_array,
+                    getOperandArray(val, args, transient_buffers));
+                inputs.emplace_back(input_array);
+              }
+
+              // Get scatter indices
+              TF_ASSIGN_OR_RETURN(mx::array scatter_indices,
+                                  getOperandArray(op.getScatterIndices(), args,
+                                                  transient_buffers));
+              // Get list of updates
+              std::vector<mx::array> updates;
+              for (Value val : op.getUpdates()) {
+                TF_ASSIGN_OR_RETURN(
+                    mx::array update_array,
+                    getOperandArray(val, args, transient_buffers));
+                updates.emplace_back(update_array);
+              }
+
+              // Get scatter dimension numbers
+              auto scatter_dimension_numbers = op.getScatterDimensionNumbers();
+              auto update_window_dims =
+                  scatter_dimension_numbers.getUpdateWindowDims();
+              auto inserted_window_dims =
+                  scatter_dimension_numbers.getInsertedWindowDims();
+              auto input_batching_dims =
+                  scatter_dimension_numbers.getInputBatchingDims();
+              auto scatter_indices_batching_dims =
+                  scatter_dimension_numbers.getScatterIndicesBatchingDims();
+              auto scatter_dims_to_operand_dims =
+                  scatter_dimension_numbers.getScatterDimsToOperandDims();
+              auto index_vector_dim =
+                  scatter_dimension_numbers.getIndexVectorDim();
+
+              // Get other scatter parameters
+              auto indices_are_sorted = op.getIndicesAreSorted();
+              auto unique_indices = op.getUniqueIndices();
+
+              // Get update computation
+              mlir::Block& update_computation =
+                  op.getUpdateComputation().front();
+
+              // iterate over updates[0] index space
+              for (const auto update_index_tuple :
+                   index_space(updates[0].shape())) {
+                std::vector<int32_t> update_index = to_vector(
+                    update_index_tuple, static_cast<size_t>(updates[0].ndim()));
+
+                // Calculate update scatter dims
+                std::vector<int32_t> update_scatter_dims;
+                for (auto i = 0; i < updates[0].ndim(); i++) {
+                  if (std::find(update_window_dims.begin(),
+                                update_window_dims.end(),
+                                static_cast<int64_t>(i)) ==
+                      update_window_dims.end()) {
+                    update_scatter_dims.emplace_back(static_cast<int32_t>(i));
+                  }
+                }
+
+                // Calculate update scatter index
+                std::vector<int32_t> update_scatter_index(update_scatter_dims.size());
+                for (auto i = 0; i < update_scatter_dims.size(); i++) {
+                  update_scatter_index[i] = update_index[update_scatter_dims[i]];
+                }
+
+                // Slice start index
+                std::vector<int32_t> sin_start = update_scatter_index;
+                std::vector<int32_t> sin_stop = update_scatter_index;
+                if (index_vector_dim < scatter_indices.ndim()) {
+                  sin_start.insert(sin_start.begin() + index_vector_dim, 0);
+                  sin_stop.insert(sin_stop.begin() + index_vector_dim,
+                                  scatter_indices.shape(index_vector_dim));
+                }
+                for (auto& d : sin_stop) d += 1;
+                mx::array start_index = mx::flatten(mx::slice(scatter_indices, sin_start, sin_stop));
+
+                // Compute full start index
+                mx::array full_start_index = mx::zeros({inputs[0].ndim()});
+
+
+                
+
+
+
+
+              }
+
+              return absl::UnimplementedError("ScatterOp not implemented yet");
+            })
             // .Case<stablehlo::ScatterOp>([&args, &transient_buffers](
             //                                 auto op) -> StatusOrArrays {
-            //   std::vector<mx::array> inputs;
+            // std::vector<mx::array> inputs;
             //   for (Value val : op.getInputs()) {
             //     TF_ASSIGN_OR_RETURN(
             //         mx::array input_array,
             //         getOperandArray(val, args, transient_buffers));
             //     inputs.emplace_back(input_array);
             //   }
-            //   // std::cout << std::to_string(inputs.size()) << " inputs"
-            //   //           << std::endl;
+
             //   TF_ASSIGN_OR_RETURN(mx::array scatter_indices,
             //                       getOperandArray(op.getScatterIndices(),
             //                       args,
@@ -1503,14 +1630,21 @@ absl::StatusOr<std::vector<mx::array>> evalFunc(
             //         getOperandArray(val, args, transient_buffers));
             //     updates.emplace_back(update_array);
             //   }
-            //   // std::cout << std::to_string(updates.size()) << " updates"
-            //   //           << std::endl;
 
-            //   func::Func update_computation = op.getUpdateComputation();
-            //   for (auto i = 0; i < inputs.size(); i++) {
-            //     Block& body_block = op.getUpdateComputation().front();
-            //     body_block.dump();
-            //   }
+            //   auto dim_numbers = op.getDimensionNumbers();
+            //   auto update_window_dims = dim_numbers.getUpdateWindowDims();
+            //   auto inserted_window_dims =
+            //   dim_numbers.getInsertedWindowDims(); auto input_batching_dims =
+            //   dim_numbers.getInputBatchingDims(); auto
+            //   scatter_indices_batching_dims =
+            //       dim_numbers.getScatterIndicesBatchingDims();
+            //   auto scatter_dims_to_operand_dims =
+            //       dim_numbers.getScatterDimsToOperandDims();
+            //   auto index_vector_dim = dim_numbers.getIndexVectorDim();
+            //   auto indices_are_sorted = op.getIndicesAreSorted();
+            //   auto unique_indices = op.getUniqueIndices();
+            //   auto update_computation_block =
+            //   op.getUpdateComputation().front();
 
             //   return absl::UnimplementedError("ScatterOp not implemented
             //   yet");
@@ -1723,7 +1857,7 @@ class MlirLoadedExecutable : public PjRtLoadedExecutable {
     // holds intermediary results of operation calls.
     std::unordered_map<Operation*, mx::array> transient_buffers;
     // std::cout << std::endl << std::endl;
-    module.dump();
+    // module.dump();
     auto main = module.lookupSymbol<mlir::func::FuncOp>("main");
     TF_ASSIGN_OR_RETURN(auto mlx_res, evalFunc(module, main, block_arguments));
 

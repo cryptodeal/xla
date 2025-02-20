@@ -36,6 +36,7 @@ cc_library(
     srcs = ["executable.cc"],
     hdrs = ["executable.h"],
     deps = [
+        "@range-v3",
         "@mlx//:libmlx",
         ":buffer",
         ":logging",
