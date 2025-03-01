@@ -21,7 +21,7 @@ limitations under the License.
 #include "mlir/IR/BuiltinAttributes.h"
 
 #define LOG_UNIMPLEMENTED(name) \
-  LOG(ERROR) << "MlirPjrtBuffer::" #name " is not implemented"
+  LOG(ERROR) << "MlxPjRtBuffer::" #name " is not implemented"
 
 #define TRACE_ME LOG(INFO) << __func__;
 
@@ -31,6 +31,7 @@ namespace mlir::stablehlo {
 std::string ToString(mlir::Attribute attr);
 std::string ToString(llvm::SmallVector<mlir::DenseElementsAttr> attrs);
 std::string ToString(Operation* op);
+std::string ToString(mlir::Value op);
 
 // Looks for `PJRT_LOG_LEVEL = INFO|WARNING|ERROR` in env variables.
 void SetupLogLevelFromEnv();

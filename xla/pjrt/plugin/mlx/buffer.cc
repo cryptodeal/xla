@@ -21,6 +21,7 @@ limitations under the License.
 #include "absl/functional/any_invocable.h"
 #include "absl/log/log.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/AsmParser/AsmParser.h"
@@ -29,6 +30,7 @@ limitations under the License.
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlx/mlx.h"
 #include "mlir/Support/DebugStringHelper.h"
 #include "xla/hlo/translate/hlo_to_mhlo/hlo_utils.h"
 #include "xla/hlo/translate/mhlo_to_hlo/literal_exporter.h"
@@ -38,9 +40,11 @@ limitations under the License.
 #include "xla/pjrt/pjrt_compiler.h"
 #include "xla/pjrt/pjrt_future.h"
 #include "xla/pjrt/plugin/mlx/logging.h"
+#include "xla/pjrt/plugin/mlx/utils.h"
 #include "xla/shape.h"
 #include "xla/util.h"
 
+namespace mx = mlx::core;
 namespace mlir::stablehlo {
 
 using xla::MutableLiteralBase;
@@ -53,14 +57,16 @@ using xla::PjRtPlatformId;
 using xla::Shape;
 
 #define UNIMPLEMENTED(name) \
-  xla::Unimplemented("MlirPjrtBuffer::" #name " is not implemented")
+  xla::Unimplemented("MlxPjrtBuffer::" #name " is not implemented")
 
-class MlirPjrtBuffer : public PjRtBuffer {
+class MlxPjrtBuffer : public PjRtBuffer {
  public:
-  MlirPjrtBuffer(const Shape& shape, PjRtMemorySpace* memory_space)
+  MlxPjrtBuffer(mx::array array, const Shape& shape,
+                PjRtMemorySpace* memory_space)
       : xla::PjRtBuffer(),
         context_(),
         buffer_(),
+        array_(array),
         shape_(shape),
         memory_space_(memory_space) {
     // TRACE_ME_MEMBER;
@@ -77,8 +83,13 @@ class MlirPjrtBuffer : public PjRtBuffer {
         LOG(ERROR) << "Could not get attribute from buffer: "
                    << mlir_buffer.status();
       }
-      buffer_ =
-          CreateMlirBufferFromAttribute(mlir_buffer.value(), memory_space);
+
+      auto array = GetArrayFromBuffer(buffer);
+      if (!array.ok()) {
+        LOG(ERROR) << "Could not get attribute from buffer: " << array.status();
+      }
+      buffer_ = CreateMlirBufferFromAttribute(
+          array.value(), mlir_buffer.value(), memory_space);
       data_ptr_ = (void*)mlir_buffer.value().getRawData().data();
     }
 
@@ -87,19 +98,20 @@ class MlirPjrtBuffer : public PjRtBuffer {
   };
 
   // All buffers are managed by the MLIR Context
-  ~MlirPjrtBuffer() override = default;
+  ~MlxPjrtBuffer() override = default;
 
-  MlirPjrtBuffer(const MlirPjrtBuffer&) = delete;
-  MlirPjrtBuffer(MlirPjrtBuffer&&) = delete;
-  MlirPjrtBuffer& operator=(const MlirPjrtBuffer&) = delete;
-  MlirPjrtBuffer& operator=(MlirPjrtBuffer&&) = delete;
+  MlxPjrtBuffer(const MlxPjrtBuffer&) = delete;
+  MlxPjrtBuffer(MlxPjrtBuffer&&) = delete;
+  MlxPjrtBuffer& operator=(const MlxPjrtBuffer&) = delete;
+  MlxPjrtBuffer& operator=(MlxPjrtBuffer&&) = delete;
 
-  static std::unique_ptr<MlirPjrtBuffer> CreateFromLiteral(
-      const xla::LiteralSlice& literal, xla::PjRtMemorySpace* memory_space) {
+  static std::unique_ptr<MlxPjrtBuffer> CreateFromLiteral(
+      mx::array array, const xla::LiteralSlice& literal,
+      xla::PjRtMemorySpace* memory_space) {
     TRACE_ME;
     LOG(INFO) << "CreateFromLiteral: " << literal.ToString() << "\n";
     auto buffer =
-        std::make_unique<MlirPjrtBuffer>(literal.shape(), memory_space);
+        std::make_unique<MlxPjrtBuffer>(array, literal.shape(), memory_space);
     LOG(INFO) << "CreateFromLiteral -> " << (void*)buffer.get() << "\n";
     mlir::Builder builder(&buffer->context_);
     auto attr = xla::CreateDenseElementsAttrFromLiteral(literal, builder);
@@ -112,13 +124,14 @@ class MlirPjrtBuffer : public PjRtBuffer {
     return buffer;
   }
 
-  static std::unique_ptr<MlirPjrtBuffer> CreateFromAttribute(
-      DenseElementsAttr attr, xla::PjRtMemorySpace* memory_space) {
+  static std::unique_ptr<MlxPjrtBuffer> CreateFromAttribute(
+      mx::array array, DenseElementsAttr attr,
+      xla::PjRtMemorySpace* memory_space) {
     TRACE_ME;
 
     // MLIR type to xla shape:
     Shape shape = xla::TypeToShape(attr.getType());
-    auto buffer = std::make_unique<MlirPjrtBuffer>(shape, memory_space);
+    auto buffer = std::make_unique<MlxPjrtBuffer>(array, shape, memory_space);
     buffer->buffer_ = CloneIntoContext(attr, buffer->context_);
     LOG(INFO) << "CreateFromAttribute(" << ToString(attr) << ") -> "
               << (void*)buffer.get() << "\n";
@@ -241,7 +254,7 @@ class MlirPjrtBuffer : public PjRtBuffer {
   absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> CopyToMemorySpace(
       xla::PjRtMemorySpace* dst_memory_space) override {
     // TRACE_ME_MEMBER;
-    return CreateMlirBufferFromAttribute(buffer_, dst_memory_space);
+    return CreateMlirBufferFromAttribute(array_, buffer_, dst_memory_space);
   }
 
   void CopyToRemoteDevice(
@@ -280,30 +293,54 @@ class MlirPjrtBuffer : public PjRtBuffer {
 
   mlir::DenseElementsAttr GetBufferAttribute() const { return buffer_; }
 
+  mx::array GetArray() const { return array_; }
+
  private:
   MLIRContext context_;
   mlir::DenseElementsAttr buffer_;
+  mx::array array_;
 
   xla::Shape shape_;
   PjRtMemorySpace* memory_space_;
 };
 
+std::unique_ptr<xla::PjRtBuffer> CreateMlirBufferFromMlxArray(
+    mx::array array, xla::PjRtMemorySpace* memory_space) {
+  TRACE_ME;
+  std::vector<int64_t> span_shape(array.shape().begin(), array.shape().end());
+  auto shape = xla::ShapeUtil::MakeShape(
+      utils::dtype::asXlaPrimitiveType(array.dtype()),
+      absl::Span<const int64_t>(span_shape.data(), span_shape.size()));
+  auto literal = xla::BorrowingLiteral(
+      reinterpret_cast<const char*>(array.data<uint8_t>()), shape);
+  return MlxPjrtBuffer::CreateFromLiteral(array, literal, memory_space);
+}
+
 std::unique_ptr<PjRtBuffer> CreateMlirBufferFromLiteral(
     const xla::LiteralSlice& literal, xla::PjRtMemorySpace* memory_space) {
   TRACE_ME;
-  return MlirPjrtBuffer::CreateFromLiteral(literal, memory_space);
+  auto maybe_array = utils::array::fromHostLiteral(literal);
+  return MlxPjrtBuffer::CreateFromLiteral(maybe_array.value(), literal,
+                                          memory_space);
 }
 
 std::unique_ptr<PjRtBuffer> CreateMlirBufferFromAttribute(
-    DenseElementsAttr attr, xla::PjRtMemorySpace* memory_space) {
+    mx::array array, DenseElementsAttr attr,
+    xla::PjRtMemorySpace* memory_space) {
   TRACE_ME;
-  return MlirPjrtBuffer::CreateFromAttribute(attr, memory_space);
+  return MlxPjrtBuffer::CreateFromAttribute(array, attr, memory_space);
 }
 
-std::unique_ptr<PjRtBuffer> CreateMlirBufferUninitizlied(
-    const Shape& shape, PjRtMemorySpace* memory_space) {
+std::unique_ptr<PjRtBuffer> CreateMlirBufferUninitialized(
+    const xla::Shape& shape, PjRtMemorySpace* memory_space) {
   TRACE_ME;
-  return std::make_unique<MlirPjrtBuffer>(shape, memory_space);
+  // TODO (@cryptodeal): C API doesn't implement this, but
+  // we'll want to ensure when the Buffer is initialized,
+  // the resulting array is correct shape/dtype.
+
+  // Init empty array of dtype
+  auto array = mx::array({});
+  return std::make_unique<MlxPjrtBuffer>(array, shape, memory_space);
 }
 
 absl::StatusOr<mlir::DenseElementsAttr> GetAttributeFromBuffer(
@@ -312,13 +349,27 @@ absl::StatusOr<mlir::DenseElementsAttr> GetAttributeFromBuffer(
   if (buffer == nullptr || buffer->IsDeleted()) {
     return xla::InvalidArgument("Buffer is null or deleted");
   }
-  auto mlir_buffer = dynamic_cast<MlirPjrtBuffer*>(buffer);
+  auto mlir_buffer = dynamic_cast<MlxPjrtBuffer*>(buffer);
   if (mlir_buffer == nullptr) {
-    return xla::InvalidArgument("Buffer is not a MlirPjrtBuffer");
+    return xla::InvalidArgument("Buffer is not a MlxPjrtBuffer");
   }
   LOG(INFO) << "GetAttributeFromBuffer(" << (void*)buffer << ") -> "
             << ToString(mlir_buffer->GetBufferAttribute()) << "\n";
   return mlir_buffer->GetBufferAttribute();
+}
+
+absl::StatusOr<mx::array> GetArrayFromBuffer(xla::PjRtBuffer* buffer) {
+  TRACE_ME;
+  if (buffer == nullptr || buffer->IsDeleted()) {
+    return xla::InvalidArgument("Buffer is null or deleted");
+  }
+  auto mlir_buffer = dynamic_cast<MlxPjrtBuffer*>(buffer);
+  if (mlir_buffer == nullptr) {
+    return xla::InvalidArgument("Buffer is not a MlxPjrtBuffer");
+  }
+  LOG(INFO) << "GetArrayFromBuffer(" << (void*)buffer << ") -> "
+            << mlir_buffer->GetArray() << "\n";
+  return mlir_buffer->GetArray();
 }
 
 DenseElementsAttr CloneIntoContext(DenseElementsAttr attr,

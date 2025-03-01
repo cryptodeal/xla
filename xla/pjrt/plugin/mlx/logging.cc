@@ -51,6 +51,13 @@ std::string ToString(Operation* op) {
   return out;
 }
 
+std::string ToString(mlir::Value value) {
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  value.print(os);
+  return out;
+}
+
 void SetupLogLevelFromEnv() {
   absl::SetMinLogLevel(absl::LogSeverityAtLeast::kError);
   const char* log_env = std::getenv("PJRT_LOG_LEVEL");

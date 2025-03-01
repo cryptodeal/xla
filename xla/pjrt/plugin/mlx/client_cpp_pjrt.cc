@@ -16,12 +16,14 @@ limitations under the License.
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "mlx/mlx.h"
 #include "xla/literal.h"
 #include "xla/pjrt/host_memory_spaces.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -31,12 +33,16 @@ limitations under the License.
 #include "xla/pjrt/plugin/mlx/device.h"
 #include "xla/pjrt/plugin/mlx/executable.h"
 #include "xla/pjrt/plugin/mlx/logging.h"
+#include "xla/pjrt/plugin/mlx/utils.h"
 #include "xla/shape_util.h"
 #include "xla/util.h"
 #include "tsl/platform/fingerprint.h"
+#include "tsl/platform/statusor.h"
+
+namespace mx = mlx::core;
 
 #define UNIMPLEMENTED(name) \
-  xla::Unimplemented("MlirPjrtBuffer::" #name " is not implemented")
+  xla::Unimplemented("MlxPjrtBuffer::" #name " is not implemented")
 
 namespace mlir::stablehlo {
 
@@ -178,7 +184,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
   absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> CreateUninitializedBuffer(
       const xla::Shape& shape, xla::PjRtDevice* device) override {
     // TRACE_ME_MEMBER;
-    return CreateMlirBufferUninitizlied(
+    return CreateMlirBufferUninitialized(
         shape, device->default_memory_space().value_or(nullptr));
   }
 
@@ -232,11 +238,10 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
       xla::PjRtMemorySpace* memory_space,
       const xla::Layout* device_layout) override {
     // TRACE_ME_MEMBER;
-    // Buffer to Literal
-    auto shape = xla::ShapeUtil::MakeShape(type, dims);
-    auto literal =
-        xla::BorrowingLiteral(reinterpret_cast<const char*>(data), shape);
-    auto buffer = CreateMlirBufferFromLiteral(literal, memory_space);
+    TF_ASSIGN_OR_RETURN(
+        mx::array array_buffer,
+        utils::array::fromHostBuffer(data, dims, byte_strides, type));
+    auto buffer = CreateMlirBufferFromMlxArray(array_buffer, memory_space);
     if (on_done_with_host_buffer) {
       // If host is awaiting the result, must call this function.
       std::move(on_done_with_host_buffer)();

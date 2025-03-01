@@ -16,19 +16,25 @@ limitations under the License.
 #include <memory>
 
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlx/mlx.h"
 #include "xla/literal.h"
 #include "xla/pjrt/pjrt_client.h"
 
-namespace mlir::stablehlo {
+namespace mx = mlx::core;
 
+namespace mlir::stablehlo {
+std::unique_ptr<xla::PjRtBuffer> CreateMlirBufferFromMlxArray(
+    mx::array array, xla::PjRtMemorySpace* memory_space);
 std::unique_ptr<xla::PjRtBuffer> CreateMlirBufferFromLiteral(
     const xla::LiteralSlice& literal, xla::PjRtMemorySpace* memory_space);
 std::unique_ptr<xla::PjRtBuffer> CreateMlirBufferFromAttribute(
-    DenseElementsAttr attribute, xla::PjRtMemorySpace* memory_space);
-std::unique_ptr<xla::PjRtBuffer> CreateMlirBufferUninitizlied(
+    mx::array array, DenseElementsAttr attribute,
+    xla::PjRtMemorySpace* memory_space);
+std::unique_ptr<xla::PjRtBuffer> CreateMlirBufferUninitialized(
     const xla::Shape& shape, xla::PjRtMemorySpace* memory_space);
 absl::StatusOr<DenseElementsAttr> GetAttributeFromBuffer(
     xla::PjRtBuffer* buffer);
+absl::StatusOr<mx::array> GetArrayFromBuffer(xla::PjRtBuffer* buffer);
 DenseElementsAttr CloneIntoContext(DenseElementsAttr attr,
                                    MLIRContext& context);
 

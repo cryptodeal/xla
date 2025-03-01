@@ -12,6 +12,7 @@ cc_library(
     hdrs = ["buffer.h"],
     deps = [
         ":logging",
+        ":utils",
         "//xla:literal",
         "//xla:shape_util",
         "//xla:util",
@@ -24,6 +25,7 @@ cc_library(
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:AsmParser",
         "@llvm-project//mlir:IR",
@@ -40,6 +42,7 @@ cc_library(
         "@mlx//:libmlx",
         ":buffer",
         ":logging",
+        ":utils",
         "//xla/hlo/builder:xla_computation",
         "//xla/hlo/translate:stablehlo",
         "//xla/mlir/utils:error_util",
@@ -100,6 +103,7 @@ cc_library(
         ":device",
         ":executable",
         ":logging",
+        ":utils",
         "//xla:literal",
         "//xla:shape_util",
         "//xla:util",
@@ -112,7 +116,9 @@ cc_library(
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
+        "@mlx//:libmlx",
         "@tsl//tsl/platform:fingerprint",
+        "@tsl//tsl/platform:statusor"
     ],
 )
 
@@ -146,6 +152,27 @@ cc_library(
         "@llvm-project//mlir:AsmParser",
         "@llvm-project//mlir:DataLayoutInterfaces",
         "@llvm-project//mlir:IR",
+    ],
+)
+
+cc_library(
+    name = "utils",
+    srcs = ["utils.cc"],
+    hdrs = ["utils.h"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+        "@mlx//:libmlx",
+        "@tsl//tsl/platform:statusor",
+        "//xla/mlir/utils:type_util",
+        "//xla:literal",
+        "//xla:shape_util",
+        "//xla:util",
+        
     ],
 )
 
