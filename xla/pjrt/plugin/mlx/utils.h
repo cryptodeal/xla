@@ -14,6 +14,7 @@ limitations under the License.
 #define XLA_PJRT_PLUGIN_STABLEHLO_MLX_UTILS_H_
 
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -62,6 +63,9 @@ absl::StatusOr<mx::array> fromOperand(
     const std::unordered_map<mlir::Operation*, std::vector<mx::array>>&
         transient_buffers);
 }  // namespace array
+
+void printVector(const std::string& name, const std::vector<int32_t>& vec,
+                 bool indent = false);
 }  // namespace utils
 
 #endif  // XLA_PJRT_PLUGIN_STABLEHLO_MLX_UTILS_H_

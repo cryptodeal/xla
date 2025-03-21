@@ -32,6 +32,7 @@ std::string ToString(mlir::Attribute attr);
 std::string ToString(llvm::SmallVector<mlir::DenseElementsAttr> attrs);
 std::string ToString(Operation* op);
 std::string ToString(mlir::Value op);
+std::string ToString(mlir::Block& block);
 
 // Looks for `PJRT_LOG_LEVEL = INFO|WARNING|ERROR` in env variables.
 void SetupLogLevelFromEnv();

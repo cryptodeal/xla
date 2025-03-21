@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <memory>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -274,4 +275,19 @@ absl::StatusOr<mx::array> fromOperand(
 }
 
 }  // namespace array
+
+void printVector(const std::string& name, const std::vector<int32_t>& vec,
+                 bool indent) {
+  if (indent) {
+    std::cout << "\t";
+  }
+  std::cout << name.c_str() << ": { ";
+  for (auto i = 0; i < vec.size(); i++) {
+    std::cout << std::to_string(vec[i]);
+    if (i < vec.size() - 1) {
+      std::cout << ", ";
+    }
+  }
+  std::cout << " }" << std::endl;
+}
 }  // namespace utils

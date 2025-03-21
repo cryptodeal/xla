@@ -12,6 +12,11 @@ limitations under the License.
 
 #include "xla/pjrt/plugin/mlx/executable.h"
 
+// rudimentary profiling
+#include <chrono>
+#include <iostream>
+#include <iomanip>
+
 #include <algorithm>
 #include <memory>
 #include <optional>
@@ -418,6 +423,63 @@ bool isAnyReduce(stablehlo::ReduceOp& reduce_op) {
   return true;
 }
 
+absl::StatusOr<std::pair<unsigned, mx::ComparatorType>> getSortInfo(
+    mlir::Block& block) {
+  unsigned op_count = 0;
+  mx::ComparatorType comparator = mx::ComparatorType::LessThan;
+  unsigned input_idx = 0;
+  for (auto& op : block.getOperations()) {
+    switch (op_count) {
+      case 0: {
+        if (auto compare_op = llvm::dyn_cast<stablehlo::CompareOp>(op)) {
+          switch (compare_op.getComparisonDirection()) {
+            case ComparisonDirection::GT: {
+              auto lhs = llvm::dyn_cast<BlockArgument>(compare_op.getLhs());
+              auto rhs = llvm::dyn_cast<BlockArgument>(compare_op.getRhs());
+              if (lhs && rhs) {
+                unsigned lhs_idx = static_cast<unsigned>(lhs.getArgNumber());
+                unsigned rhs_idx = static_cast<unsigned>(rhs.getArgNumber());
+                if (rhs_idx - 1 == lhs_idx) {
+                  comparator = mx::ComparatorType::GreaterThan;
+                  input_idx = lhs_idx == 0 ? 0 : lhs_idx / 2;
+                  break;
+                }
+              }
+              return xla::Internal("Unsupported comparator: %s",
+                                   ToString(block));
+            }
+            case ComparisonDirection::LT: {
+              auto lhs = llvm::dyn_cast<BlockArgument>(compare_op.getLhs());
+              auto rhs = llvm::dyn_cast<BlockArgument>(compare_op.getRhs());
+              if (lhs && rhs) {
+                unsigned lhs_idx = static_cast<unsigned>(lhs.getArgNumber());
+                unsigned rhs_idx = static_cast<unsigned>(rhs.getArgNumber());
+                if (rhs_idx - 1 == lhs_idx) {
+                  comparator = mx::ComparatorType::LessThan;
+                  input_idx = lhs_idx == 0 ? 0 : lhs_idx / 2;
+                  break;
+                }
+              }
+              return xla::Internal("Unsupported comparator: %s",
+                                   ToString(block));
+            }
+            default:
+              return xla::Internal("Unsupported comparator: %s",
+                                   ToString(block));
+          }
+          break;
+        }
+      }
+      case 1:
+        if (llvm::dyn_cast<stablehlo::ReturnOp>(op)) break;
+      default:
+        return xla::Internal("Unsupported comparator: %s", ToString(block));
+    }
+    op_count++;
+  }
+  return std::make_pair(input_idx, comparator);
+}
+
 absl::StatusOr<mx::array> getOperandArray(
     const Value& operand,
     std::unordered_map<
@@ -464,8 +526,8 @@ absl::StatusOr<std::vector<mx::array>> evalBlock(
           args, std::unordered_map<Operation*, std::vector<mx::array>>{}));
   Operation* result_op = nullptr;
   for (Operation& op : block.getOperations()) {
-    // op.dump();
-
+    std::cout << op.getName().getStringRef().str().c_str();
+    auto start = std::chrono::high_resolution_clock::now();
     // switch on the operation type
     auto maybe_result =
         llvm::TypeSwitch<Operation*, StatusOrArrays>(&op)
@@ -1086,18 +1148,16 @@ absl::StatusOr<std::vector<mx::array>> evalBlock(
               if (min_rank == operand.ndim()) {
                 std::vector<int32_t> padded_shape = operand.shape();
                 for (auto i = 0; i < target_shape.size(); i++) {
-                  if (i < min_rank) {
-                    if (padded_shape[i] != target_shape[i])
-                      goto endif;
-                    else
-                      continue;
-                  } else {
-                    padded_shape.push_back(1);
+                  if (auto search =
+                          std::find(op.getBroadcastDimensions().begin(),
+                                    op.getBroadcastDimensions().end(),
+                                    static_cast<int64_t>(i));
+                      search == op.getBroadcastDimensions().end()) {
+                    padded_shape.insert(padded_shape.begin() + i, 1);
                   }
                 }
                 operand = mx::reshape(operand, padded_shape);
               }
-            endif:
               return std::vector<mx::array>{
                   mx::broadcast_to(operand, target_shape)};
             })
@@ -1573,102 +1633,32 @@ absl::StatusOr<std::vector<mx::array>> evalBlock(
             // .Case<stablehlo::SelectAndScatterOp>([](auto op) {})
             // .Case<stablehlo::SetDimensionSizeOp>([](auto op) {})
             // TODO (@cryptodeal): finish implementation
-            .Case<stablehlo::SortOp>([&block_ctx,
-                                      &module](auto op) -> StatusOrArrays {
-              // Get list of input(s)
-              std::vector<mx::array> inputs;
-              for (Value val : op.getInputs()) {
-                TF_ASSIGN_OR_RETURN(mx::array input_array,
-                                    getOperandArray(val, block_ctx));
-                inputs.emplace_back(input_array);
-              }
+            .Case<stablehlo::SortOp>(
+                [&block_ctx, &module](auto op) -> StatusOrArrays {
+                  // Get list of input(s)
+                  std::vector<mx::array> inputs;
+                  for (Value val : op.getInputs()) {
+                    TF_ASSIGN_OR_RETURN(mx::array input_array,
+                                        getOperandArray(val, block_ctx));
+                    inputs.emplace_back(input_array);
+                  }
 
-              for (auto i = 0; i < inputs.size(); i++) {
-                std::cout << "inputs[" << std::to_string(i)
-                          << "]: " << inputs[i] << std::endl;
-              }
+                  int dim = static_cast<int>(op.getDimension());
 
-              int dimension = static_cast<int>(op.getDimension());
-              auto is_stable = op.getIsStable();
+                  // Get update computation
+                  mlir::Block& comparator = op.getComparator().front();
 
-              // Get update computation
-              mlir::Block& comparator = op.getComparator().front();
+                  TF_ASSIGN_OR_RETURN(auto comp_info, getSortInfo(comparator));
+                  auto [index, comp_type] = comp_info;
 
-              // Adjust for negative dimension
-              int adjusted_dimension =
-                  dimension >= 0
-                      ? dimension
-                      : static_cast<int>(inputs[0].ndim()) + dimension;
+                  auto indices = mx::argsort(inputs[index], dim, comp_type);
 
-              std::vector<mx::array> results = inputs;
-              std::vector<mx::array> input_slices(inputs.size(), mx::array({}));
-              std::vector<mx::array> comparator_args(inputs.size() * 2,
-                                                     mx::array({}));
-
-              for (const auto result_index_tuple :
-                   index_space(results[0].shape())) {
-                std::vector<int32_t> result_index = to_vector(
-                    result_index_tuple, static_cast<size_t>(results[0].ndim()));
-                    
-                std::vector<int32_t> result_slice_start = result_index;
-                result_slice_start[adjusted_dimension] = 0;
-                std::vector<int32_t> result_slice_stop = result_index;
-                result_slice_stop[adjusted_dimension] =
-                    results[0].shape(adjusted_dimension);
-                for (auto& d : result_slice_stop) d += 1;
-                for (auto i = 0; i < input_slices.size(); i++) {
-                  input_slices[i] = mx::slice(inputs[i], result_slice_start,
-                                              result_slice_stop);
-                }
-
-                std::vector<int32_t> scatter_indices_(input_slices[0].size());
-                std::iota(scatter_indices_.begin(), scatter_indices_.end(), 0);
-                std::sort(
-                    scatter_indices_.begin(), scatter_indices_.end(),
-                    [&block_ctx, &comparator, &comparator_args, &input_slices,
-                     &module](const auto& lhs, const auto& rhs) -> bool {
-                      for (auto i = 0; i < input_slices.size(); i++) {
-                        auto flattened_input_slice =
-                            mx::flatten(input_slices[i]);
-                        comparator_args[i * 2] =
-                            mx::slice(flattened_input_slice, {lhs}, {lhs + 1});
-                        comparator_args[i * 2 + 1] =
-                            mx::slice(flattened_input_slice, {rhs}, {rhs + 1});
-                      }
-                      auto scoped_ctx = block_ctx;
-                      auto comp_res = evalBlock(module, comparator,
-                                                comparator_args, scoped_ctx);
-                      TF_CHECK_OK(comp_res.status());
-                      return (*comp_res)[0].item<bool>();
-                    });
-
-                auto scatter_indices = mx::array(
-                    scatter_indices_.data(),
-                    {static_cast<int>(scatter_indices_.size())}, mx::int32);
-                for (auto i = 0; i < results.size(); i++) {
-                  auto flattened_input_slice = mx::flatten(input_slices[i]);
-                  auto sorted_slice = mx::reshape(
-                      mx::scatter(flattened_input_slice, scatter_indices,
-                                  mx::expand_dims(flattened_input_slice, -1),
-                                  0),
-                      input_slices[i].shape());
-                  std::cout << std::to_string(i)
-                            << ": sorted_slice = " << sorted_slice << std::endl;
-
-                  results[i] =
-                      mx::slice_update(results[i], sorted_slice,
-                                       result_slice_start, result_slice_stop);
-                }
-                mx::eval(results);
-              }
-
-              for (auto i = 0; i < results.size(); i++) {
-                std::cout << "results[" << std::to_string(i)
-                          << "]: " << results[i] << std::endl;
-              }
-
-              return results;
-            })
+                  std::vector<mx::array> res(inputs.size(), mx::array({}));
+                  for (auto i = 0; i < res.size(); i++) {
+                    res[i] = mx::take_along_axis(inputs[i], indices, dim);
+                  }
+                  return res;
+                })
             // .Case<stablehlo::ReverseOp>([](auto op) {})
             .Case<stablehlo::PadOp>([&block_ctx](auto op) -> StatusOrArrays {
               TF_ASSIGN_OR_RETURN(mx::array operand,
@@ -1804,6 +1794,13 @@ absl::StatusOr<std::vector<mx::array>> evalBlock(
     } else {
       return maybe_result.status();
     }
+
+    auto end = std::chrono::high_resolution_clock::now();
+
+    auto duration =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    std::cout << "\t--\tTime taken: " << duration.count() << " ms" << std::endl;
   }
 
   return (&std::get<1>(ctx->second))->find(result_op)->second;
@@ -1891,9 +1888,9 @@ class MlirLoadedExecutable : public PjRtLoadedExecutable {
       block_arguments.emplace_back(input_arr);
     }
 
-    std::cout << std::endl;
-    module.dump();
-    std::cout << std::endl;
+    // std::cout << std::endl;
+    // module.dump();
+    // std::cout << std::endl;
     auto main = module.lookupSymbol<mlir::func::FuncOp>("main");
     std::unordered_map<
         mlir::Block*,
