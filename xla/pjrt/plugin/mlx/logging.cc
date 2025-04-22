@@ -43,6 +43,12 @@ std::string ToString(SmallVector<DenseElementsAttr> attrs) {
   os << "]";
   return out;
 }
+std::string ToString(Operation& op) {
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  op.print(os);
+  return out;
+}
 
 std::string ToString(Operation* op) {
   std::string out;

@@ -69,7 +69,7 @@ class MlxPjrtBuffer : public PjRtBuffer {
         array_(array),
         shape_(shape),
         memory_space_(memory_space) {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
   }
 
   class MlirClonedExternalReference : public ExternalReference {
@@ -77,7 +77,7 @@ class MlxPjrtBuffer : public PjRtBuffer {
     explicit MlirClonedExternalReference(PjRtBuffer* buffer,
                                          PjRtMemorySpace* memory_space)
         : buffer_() {
-      // TRACE_ME_MEMBER;
+      TRACE_ME_MEMBER;
       auto mlir_buffer = GetAttributeFromBuffer(buffer);
       if (!mlir_buffer.ok()) {
         LOG(ERROR) << "Could not get attribute from buffer: "
@@ -108,7 +108,7 @@ class MlxPjrtBuffer : public PjRtBuffer {
   static std::unique_ptr<MlxPjrtBuffer> CreateFromLiteral(
       mx::array array, const xla::LiteralSlice& literal,
       xla::PjRtMemorySpace* memory_space) {
-    TRACE_ME;
+    // TRACE_ME;
     LOG(INFO) << "CreateFromLiteral: " << literal.ToString() << "\n";
     auto buffer =
         std::make_unique<MlxPjrtBuffer>(array, literal.shape(), memory_space);
@@ -127,7 +127,7 @@ class MlxPjrtBuffer : public PjRtBuffer {
   static std::unique_ptr<MlxPjrtBuffer> CreateFromAttribute(
       mx::array array, DenseElementsAttr attr,
       xla::PjRtMemorySpace* memory_space) {
-    TRACE_ME;
+    // TRACE_ME;
 
     // MLIR type to xla shape:
     Shape shape = xla::TypeToShape(attr.getType());
@@ -139,51 +139,51 @@ class MlxPjrtBuffer : public PjRtBuffer {
   }
 
   const Shape& on_device_shape() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return shape_;
   }
   absl::StatusOr<Shape> logical_on_device_shape() override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return shape_;
   }
 
   PjRtPlatformId platform_id() const {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return client()->platform_id();
   }
   absl::string_view platform_name() const {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return client()->platform_name();
   }
 
   bool IsEmptyTuple() const {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return shape_.IsTuple() && shape_.tuple_shapes().empty();
   }
 
   // Buffer knows device + client per older design, should only need
   // memory_space.
   PjRtMemorySpace* memory_space() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return memory_space_;
   }
   PjRtDevice* device() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return memory_space_->devices().front();
   }
   PjRtClient* client() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return memory_space_->client();
   }
 
   absl::StatusOr<std::unique_ptr<xla::PjRtBuffer::ExternalReference>>
   AcquireExternalReference() override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return std::make_unique<MlirClonedExternalReference>(this, memory_space_);
   }
 
   xla::PjRtFuture<> ToLiteral(xla::MutableLiteralBase* literal) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     if (IsEmptyTuple()) {
       return PjRtFuture<>(
           xla::InvalidArgument("ToLiteral called on empty tuple"));
@@ -203,7 +203,7 @@ class MlxPjrtBuffer : public PjRtBuffer {
   PjRtFuture<> LazyToLiteral(
       absl::AnyInvocable<absl::StatusOr<MutableLiteralBase*>() &&> generator)
       override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     auto buffer = std::move(generator)();
     if (!buffer.ok()) return PjRtFuture<>(buffer.status());
     return ToLiteral(buffer.value());
@@ -212,20 +212,20 @@ class MlxPjrtBuffer : public PjRtBuffer {
   absl::StatusOr<size_t> GetOnDeviceSizeInBytes() const override {
     // This is needed by AcquireExternalReference, for framework figuring out
     // how to read the underlying buffer data.
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     if (!buffer_) return 0;
     return buffer_.getRawData().size();
   }
 
   PjRtFuture<> CopyRawToHost(void* dst, int64_t offset,
                              int64_t transfer_size) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return PjRtFuture<>(UNIMPLEMENTED(CopyRawToHost));
   }
 
   absl::StatusOr<std::unique_ptr<ExternalReference>>
   ReleaseDeviceMemoryOwnership(bool wait_for_operations_to_complete) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     auto external_ref = AcquireExternalReference();
     Delete();
     return external_ref;
@@ -235,32 +235,32 @@ class MlxPjrtBuffer : public PjRtBuffer {
   // Note: deleted and uninitialized appear the same in this scenario.
   // Consider changing to mlir::NoneType when deleted.
   void Delete() override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     buffer_ = {};
   }
 
   bool IsDeleted() override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return !buffer_;
   }
 
   absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> CopyToDevice(
       xla::PjRtDevice* dst_device) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return CopyToMemorySpace(
         dst_device->default_memory_space().value_or(nullptr));
   }
 
   absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> CopyToMemorySpace(
       xla::PjRtMemorySpace* dst_memory_space) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return CreateMlirBufferFromAttribute(array_, buffer_, dst_memory_space);
   }
 
   void CopyToRemoteDevice(
       xla::PjRtFuture<std::string> serialized_descriptor,
       xla::PjRtBuffer::RemoteSendCallback on_done) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     on_done(UNIMPLEMENTED(CopyToRemoteDevice), false);
   }
 
@@ -268,14 +268,14 @@ class MlxPjrtBuffer : public PjRtBuffer {
       xla::PjRtFuture<std::vector<std::string>> serialized_descriptors,
       std::vector<RemoteSendCallback> callbacks,
       const xla::PjRtBuffer::ScatterDetails& scatter_details) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     for (auto cb : callbacks) {
       cb(UNIMPLEMENTED(CopyToRemoteDeviceScattered), false);
     }
   }
 
   xla::PjRtFuture<> GetReadyFuture() override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     LOG(INFO) << "GetReadyFuture(" << (void*)this << ")\n";
     // Synchronous! To make async, have the device make a buffer with a ready
     // future that is ready when the computation is done / buffer is ready.
@@ -287,7 +287,7 @@ class MlxPjrtBuffer : public PjRtBuffer {
     // GetExternalReference, lse it is copied back to host.
     // Since we are using reference interpreter, we are running on CPU in a
     // shared memory space.
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return false;
   }
 
@@ -306,7 +306,7 @@ class MlxPjrtBuffer : public PjRtBuffer {
 
 std::unique_ptr<xla::PjRtBuffer> CreateMlirBufferFromMlxArray(
     mx::array array, xla::PjRtMemorySpace* memory_space) {
-  TRACE_ME;
+  // TRACE_ME;
   std::vector<int64_t> span_shape(array.shape().begin(), array.shape().end());
   auto shape = xla::ShapeUtil::MakeShape(
       utils::dtype::asXlaPrimitiveType(array.dtype()),
@@ -318,7 +318,7 @@ std::unique_ptr<xla::PjRtBuffer> CreateMlirBufferFromMlxArray(
 
 std::unique_ptr<PjRtBuffer> CreateMlirBufferFromLiteral(
     const xla::LiteralSlice& literal, xla::PjRtMemorySpace* memory_space) {
-  TRACE_ME;
+  // TRACE_ME;
   auto maybe_array = utils::array::fromHostLiteral(literal);
   return MlxPjrtBuffer::CreateFromLiteral(maybe_array.value(), literal,
                                           memory_space);
@@ -327,13 +327,13 @@ std::unique_ptr<PjRtBuffer> CreateMlirBufferFromLiteral(
 std::unique_ptr<PjRtBuffer> CreateMlirBufferFromAttribute(
     mx::array array, DenseElementsAttr attr,
     xla::PjRtMemorySpace* memory_space) {
-  TRACE_ME;
+  // TRACE_ME;
   return MlxPjrtBuffer::CreateFromAttribute(array, attr, memory_space);
 }
 
 std::unique_ptr<PjRtBuffer> CreateMlirBufferUninitialized(
     const xla::Shape& shape, PjRtMemorySpace* memory_space) {
-  TRACE_ME;
+  // TRACE_ME;
   // TODO (@cryptodeal): C API doesn't implement this, but
   // we'll want to ensure when the Buffer is initialized,
   // the resulting array is correct shape/dtype.
@@ -345,7 +345,7 @@ std::unique_ptr<PjRtBuffer> CreateMlirBufferUninitialized(
 
 absl::StatusOr<mlir::DenseElementsAttr> GetAttributeFromBuffer(
     xla::PjRtBuffer* buffer) {
-  TRACE_ME;
+  // TRACE_ME;
   if (buffer == nullptr || buffer->IsDeleted()) {
     return xla::InvalidArgument("Buffer is null or deleted");
   }
@@ -359,7 +359,7 @@ absl::StatusOr<mlir::DenseElementsAttr> GetAttributeFromBuffer(
 }
 
 absl::StatusOr<mx::array> GetArrayFromBuffer(xla::PjRtBuffer* buffer) {
-  TRACE_ME;
+  // TRACE_ME;
   if (buffer == nullptr || buffer->IsDeleted()) {
     return xla::InvalidArgument("Buffer is null or deleted");
   }
@@ -367,8 +367,7 @@ absl::StatusOr<mx::array> GetArrayFromBuffer(xla::PjRtBuffer* buffer) {
   if (mlir_buffer == nullptr) {
     return xla::InvalidArgument("Buffer is not a MlxPjrtBuffer");
   }
-  LOG(INFO) << "GetArrayFromBuffer(" << (void*)buffer << ") -> "
-            << mlir_buffer->GetArray() << "\n";
+
   return mlir_buffer->GetArray();
 }
 

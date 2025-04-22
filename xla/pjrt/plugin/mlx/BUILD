@@ -33,13 +33,14 @@ cc_library(
     ],
 )
 
+
 cc_library(
     name = "executable",
     srcs = ["executable.cc"],
     hdrs = ["executable.h"],
     deps = [
         "@range-v3",
-        "@mlx//:libmlx",
+        "@mlx//:mlx",
         ":buffer",
         ":logging",
         ":utils",
@@ -48,6 +49,7 @@ cc_library(
         "//xla/mlir/utils:error_util",
         "//xla/mlir_hlo:mhlo_passes",
         "//xla/mlir_hlo:stablehlo_extension_passes",
+        # "//xla/mlir/utils:type_util",
         "//xla/pjrt:mlir_to_hlo",
         "//xla/pjrt:pjrt_client",
         "//xla/pjrt:pjrt_executable",
@@ -87,6 +89,7 @@ cc_library(
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
+        "@mlx//:mlx",
     ],
 )
 
@@ -116,7 +119,7 @@ cc_library(
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
-        "@mlx//:libmlx",
+        "@mlx//:mlx",
         "@tsl//tsl/platform:fingerprint",
         "@tsl//tsl/platform:statusor"
     ],
@@ -166,7 +169,7 @@ cc_library(
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Support",
-        "@mlx//:libmlx",
+        "@mlx//:mlx",
         "@tsl//tsl/platform:statusor",
         "//xla/mlir/utils:type_util",
         "//xla:literal",
@@ -194,6 +197,5 @@ xla_cc_binary(
     linkshared = True,
     deps = [
         ":client_c_pjrt",
-        "@mlx//:libmlx",
     ],
 )

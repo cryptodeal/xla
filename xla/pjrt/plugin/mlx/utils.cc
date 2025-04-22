@@ -134,7 +134,6 @@ int mlirTypeByteWidth(mlir::Type type) {
       xla::ConvertMlirTypeToPrimitiveType(type));
 }
 }  // namespace dtype
-namespace shape {}  // namespace shape
 
 namespace array {
 absl::StatusOr<mx::array> fromHostBuffer(

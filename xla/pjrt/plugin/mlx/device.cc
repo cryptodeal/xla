@@ -62,40 +62,40 @@ class StablehloMlxDeviceDescription final : public PjRtDeviceDescription {
         debug_string_(mlxDeviceToString(mx::default_device())),
         to_string_(absl::StrFormat("%s(id=%d,pid=%d)", debug_string_,
                                    id_.value(), process_index_)) {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
   }
 
   int id() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return id_.value();
   }
   int process_index() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return process_index_;
   }
   int local_hardware_id() const {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return local_hardware_id_;
   }
 
   absl::string_view device_kind() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return DebugString();
   }
 
   absl::string_view DebugString() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return debug_string_;
   }
 
   absl::string_view ToString() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return to_string_;
   }
 
   const absl::flat_hash_map<std::string, PjRtDeviceAttribute>& Attributes()
       const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return attributes_;
   }
 
@@ -113,56 +113,56 @@ class StablehloMlxDevice : public PjRtDevice {
  public:
   explicit StablehloMlxDevice(PjRtClient* client)
       : PjRtDevice(), client_(client), description_(0, 0) {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
   }
 
   absl::string_view DebugString() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return "StablehloMlxDevice";
   }
 
   PjRtLocalDeviceId local_device_id() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return PjRtLocalDeviceId(local_hardware_id().value());
   }
 
   PjRtLocalHardwareId local_hardware_id() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return PjRtLocalHardwareId(description_.local_hardware_id());
   }
 
   PjRtClient* client() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return client_;
   }
 
   bool IsAddressable() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return process_index() == client()->process_index();
   }
 
   absl::Status TransferToInfeed(const LiteralSlice& literal) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return UNIMPLEMENTED(TransferToInfeed);
   }
 
   absl::Status TransferFromOutfeed(MutableBorrowingLiteral literal) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return UNIMPLEMENTED(TransferFromOutfeed);
   }
 
   void AttachDefaultMemorySpace(PjRtMemorySpace* memory_space) {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     memory_space_ = memory_space;
   }
 
   absl::Span<PjRtMemorySpace* const> memory_spaces() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return absl::MakeSpan(&memory_space_, 1);
   }
 
   absl::StatusOr<PjRtMemorySpace*> default_memory_space() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     if (!memory_space_)
       return absl::InternalError("Plugin memory space unset.");
 
@@ -171,13 +171,13 @@ class StablehloMlxDevice : public PjRtDevice {
 
   std::unique_ptr<ScopedAsyncTrackingEvent> CreateAsyncTrackingEvent(
       absl::string_view description) const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     LOG(FATAL) << "Plugin does not implement CreateAsyncTrackingEvent.";
     return nullptr;
   }
 
   const PjRtDeviceDescription& description() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return description_;
   }
 

@@ -31,6 +31,7 @@ namespace mlir::stablehlo {
 std::string ToString(mlir::Attribute attr);
 std::string ToString(llvm::SmallVector<mlir::DenseElementsAttr> attrs);
 std::string ToString(Operation* op);
+std::string ToString(Operation& op);
 std::string ToString(mlir::Value op);
 std::string ToString(mlir::Block& block);
 

@@ -58,7 +58,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
         owned_memory_space_(),
         memory_space_(nullptr) {
     // Init device and memory space.
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     owned_devices_.push_back(GetStablehloMlxDevice(this));
     devices_.push_back(owned_devices_.back().get());
     owned_memory_space_ = std::make_unique<xla::UnpinnedHostMemorySpace>(
@@ -67,51 +67,53 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
     AttachStablehloMlxMemorySpace(devices_.front(), memory_space_);
   }
 
-  ~StablehloMlxPjrtClient() override {};
+  ~StablehloMlxPjrtClient() override {
+    // mx::metal::stop_capture();
+  };
 
   absl::string_view platform_name() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return kStablehloMlxBackendName;
   }
   int process_index() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return 0;
   }
 
   int device_count() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return devices_.size();
   }
 
   int addressable_device_count() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return devices_.size();
   }
 
   absl::Span<xla::PjRtDevice* const> devices() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return devices_;
   }
   absl::Span<xla::PjRtDevice* const> addressable_devices() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return devices_;
   }
 
   absl::Span<xla::PjRtMemorySpace* const> memory_spaces() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return absl::MakeSpan(&memory_space_, 1);
   }
 
   // Return an ID that identifies the platform via tsl fingerprint.
   xla::PjRtPlatformId platform_id() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return kStablehloMlxBackendId;
   }
 
   // Returns a string containing human-readable, platform-specific version
   // info (e.g. the CUDA version on GPU or libtpu version on Cloud TPU).
   absl::string_view platform_version() const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return "StableHLO MLX v0.1";
   }
 
@@ -124,7 +126,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
   // a vector a device pointers?
   absl::StatusOr<xla::PjRtDevice*> LookupDevice(
       xla::PjRtGlobalDeviceId global_device_id) const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     for (auto device : devices_) {
       if (device->global_device_id() == global_device_id) {
         return device;
@@ -137,7 +139,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
 
   absl::StatusOr<xla::PjRtDevice*> LookupAddressableDevice(
       xla::PjRtLocalDeviceId local_device_id) const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
 
     for (auto* device : addressable_devices()) {
       if (local_device_id == device->local_device_id()) {
@@ -151,7 +153,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
 
   absl::StatusOr<xla::DeviceAssignment> GetDefaultDeviceAssignment(
       int num_replicas, int num_partitions) const override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     xla::DeviceAssignment assignment(num_replicas, num_partitions);
     for (int64_t i = 0; i < num_replicas; ++i) {
       for (int64_t j = 0; j < num_partitions; ++j) {
@@ -183,7 +185,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
 
   absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> CreateUninitializedBuffer(
       const xla::Shape& shape, xla::PjRtDevice* device) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return CreateMlirBufferUninitialized(
         shape, device->default_memory_space().value_or(nullptr));
   }
@@ -191,7 +193,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
   absl::StatusOr<std::unique_ptr<PjRtClient::AsyncHostToDeviceTransferManager>>
   CreateBuffersForAsyncHostToDevice(absl::Span<const xla::Shape> shapes,
                                     xla::PjRtDevice* device) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return CreateBuffersForAsyncHostToDevice(
         shapes, device->default_memory_space().value_or(nullptr));
   }
@@ -200,7 +202,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
   CreateBuffersForAsyncHostToDevice(
       absl::Span<const xla::Shape> shapes,
       xla::PjRtMemorySpace* memory_space) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return UNIMPLEMENTED(CreateBuffersForAsyncHostToDevice);
   }
 
@@ -210,7 +212,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
       HostBufferSemantics host_buffer_semantics,
       absl::AnyInvocable<void() &&> on_done_with_host_buffer,
       xla::PjRtDevice* device) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return BufferFromHostBuffer(
         data, type, dims, byte_strides, host_buffer_semantics,
         std::move(on_done_with_host_buffer),
@@ -223,7 +225,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
       HostBufferSemantics host_buffer_semantics,
       absl::AnyInvocable<void() &&> on_done_with_host_buffer,
       xla::PjRtDevice* device, const xla::Layout* device_layout) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return BufferFromHostBuffer(
         data, type, dims, byte_strides, host_buffer_semantics,
         std::move(on_done_with_host_buffer),
@@ -237,7 +239,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
       absl::AnyInvocable<void() &&> on_done_with_host_buffer,
       xla::PjRtMemorySpace* memory_space,
       const xla::Layout* device_layout) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     TF_ASSIGN_OR_RETURN(
         mx::array array_buffer,
         utils::array::fromHostBuffer(data, dims, byte_strides, type));
@@ -252,7 +254,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
 
   absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> BufferFromHostLiteral(
       const xla::LiteralSlice& literal, xla::PjRtDevice* device) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return CreateMlirBufferFromLiteral(
         literal, device->default_memory_space().value_or(nullptr));
   }
@@ -260,7 +262,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
   absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> BufferFromHostLiteral(
       const xla::LiteralSlice& literal,
       xla::PjRtMemorySpace* memory_space) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return CreateMlirBufferFromLiteral(literal, memory_space);
   }
 
@@ -269,7 +271,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
   ///////////
   absl::StatusOr<std::unique_ptr<xla::PjRtLoadedExecutable>> Compile(
       mlir::ModuleOp module, xla::CompileOptions options) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return mlir::stablehlo::StablehloMlxCompile(
         module, GetDefaultDeviceAssignment(1, devices_.size()).value(), this);
   }
@@ -278,7 +280,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
   absl::StatusOr<std::unique_ptr<xla::PjRtLoadedExecutable>> Compile(
       const xla::XlaComputation& computation,
       xla::CompileOptions options) override {
-    // TRACE_ME_MEMBER;
+    TRACE_ME_MEMBER;
     return mlir::stablehlo::StablehloMlxCompile(
         computation.proto(),
         GetDefaultDeviceAssignment(1, devices_.size()).value(), this);
@@ -292,6 +294,7 @@ class StablehloMlxPjrtClient : public xla::PjRtClient {
 };  // end class
 
 std::unique_ptr<xla::PjRtClient> CreateStablehloMlxPjrtClient() {
+  // mx::metal::start_capture("mlx_trace.gputrace");
   SetupLogLevelFromEnv();
   return std::make_unique<StablehloMlxPjrtClient>();
 }

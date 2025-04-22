@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -30,6 +31,14 @@ limitations under the License.
 namespace mx = mlx::core;
 
 namespace utils {
+
+enum ScatterType {
+  Replace,
+  Add,
+  Prod,
+  Max,
+  Min,
+};
 namespace dtype {
 xla::PrimitiveType asXlaPrimitiveType(mx::Dtype dtype);
 
@@ -39,8 +48,6 @@ absl::StatusOr<mx::Dtype> fromMlirType(mlir::Type type);
 
 int mlirTypeByteWidth(mlir::Type type);
 }  // namespace dtype
-
-namespace shape {}  // namespace shape
 
 namespace array {
 absl::StatusOr<mx::array> fromHostBuffer(
@@ -67,5 +74,56 @@ absl::StatusOr<mx::array> fromOperand(
 void printVector(const std::string& name, const std::vector<int32_t>& vec,
                  bool indent = false);
 }  // namespace utils
+
+// Helper function to hash a tuple
+template <class T>
+inline void hash_combine(std::size_t& seed, const T& val) {
+  seed ^= std::hash<T>{}(val) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+}
+
+template <class Tuple, std::size_t Index = 0>
+inline
+    typename std::enable_if<Index == std::tuple_size<Tuple>::value, void>::type
+    hash_tuple(std::size_t&, const Tuple&) {}
+
+template <class Tuple, std::size_t Index = 0>
+    inline typename std::enable_if <
+    Index<std::tuple_size<Tuple>::value, void>::type hash_tuple(
+        std::size_t& seed, const Tuple& tuple) {
+  hash_combine(seed, std::get<Index>(tuple));
+  hash_tuple<Tuple, Index + 1>(seed, tuple);
+}
+
+template <>
+struct std::hash<utils::ScatterType> {
+  std::size_t operator()(const utils::ScatterType& value) const noexcept {
+    return std::hash<std::underlying_type<utils::ScatterType>::type>{}(
+        static_cast<std::underlying_type<utils::ScatterType>::type>(value));
+  }
+};
+
+template <typename T>
+struct std::hash<std::vector<T>> {
+  std::size_t operator()(const std::vector<T>& vec) const {
+    std::size_t seed = 0;
+    for (const T& elem : vec) {
+      seed ^= std::hash<T>{}(elem) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    }
+    return seed;
+  }
+};
+
+template <>
+struct std::hash<mx::Dtype> {
+  std::size_t operator()(const mx::Dtype& dtype) const noexcept {
+    std::size_t seed = 0;
+    hash_combine(seed, std::hash<uint8_t>{}(dtype.size()));
+    hash_combine(seed,
+                 std::hash<std::underlying_type<mx::Dtype::Val>::type>{}(
+                     static_cast<std::underlying_type<mx::Dtype::Val>::type>(
+                         dtype.val())));
+    return seed;
+  }
+};
 
 #endif  // XLA_PJRT_PLUGIN_STABLEHLO_MLX_UTILS_H_
